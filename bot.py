@@ -23,7 +23,7 @@ import pandas as pd
 import ta
 
 # ====== CONFIG ======
-API_TOKEN = os.environ.get("DERIV_API_TOKEN", "pat_2bec83d052f103c426fb50e98ff124f73f6cf52406c04e2d8207c755533fabc2")
+API_TOKEN = os.environ.get("DERIV_API_TOKEN", "pat_3d4176dca9da8e3eeebbc2ef303e91725c0005a721f675e5287acfb67245a953)
 APP_ID = 1089  # Deriv's default public app_id, fine for personal bots
 SYMBOL = "R_75"          # e.g. Volatility 75 Index. Change to "frxEURUSD" etc for forex
 GRANULARITY = 3600        # candle size in seconds (3600 = 1 hour, 86400 = 1 day)
