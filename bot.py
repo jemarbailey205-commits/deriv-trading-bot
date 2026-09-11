@@ -1,4 +1,4 @@
-"""
+    """
 Deriv MACD + Awesome Oscillator Reversal Bot
 ----------------------------------------------
 Strategy:
@@ -13,11 +13,17 @@ Strategy:
 This trades on Deriv's synthetic indices / forex via the official
 WebSocket API. It uses your Deriv API token (from Settings -> API Token in
 your Deriv account), NOT your email and password.
+
+IMPORTANT: The API token is read from the DERIV_API_TOKEN environment
+variable only. Never hardcode your token in this file, since this repo
+is public on GitHub. Set DERIV_API_TOKEN in your Railway project's
+Variables tab instead.
 """
 
 import asyncio
 import json
 import os
+import sys
 import websockets
 import pandas as pd
 import ta
@@ -34,15 +40,6 @@ DURATION_UNIT = "m"       # duration unit for the contract (m = minutes)
 MIN_STREAK = 5            # minimum consecutive same-colour AO bars before a flip counts
 
 DERIV_WS_URL = f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}"
-
-
-async def send_and_wait(ws, request):
-    await ws.send(json.dumps(request))
-    while True:
-        response = json.loads(await ws.recv())
-        if response.get("echo_req", {}).get(request.get("ticks_history", request.get("authorize", request.get("buy", "")))) is not None:
-            pass
-        return response
 
 
 async def get_candles(ws):
@@ -132,6 +129,11 @@ async def place_trade(ws, contract_type):
 
 
 async def main():
+    if not API_TOKEN:
+        print("ERROR: DERIV_API_TOKEN environment variable is not set.")
+        print("Set it in Railway under your service's Variables tab.")
+        sys.exit(1)
+
     async with websockets.connect(DERIV_WS_URL) as ws:
         await ws.send(json.dumps({"authorize": API_TOKEN}))
         auth_response = json.loads(await ws.recv())
