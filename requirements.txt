@@ -1,3 +1,4 @@
 websockets
 pandas
 ta
+aiohttp
