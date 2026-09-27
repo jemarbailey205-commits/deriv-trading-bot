@@ -36,7 +36,7 @@ API_TOKEN     = os.environ.get("DERIV_API_TOKEN")
 APP_ID        = os.environ.get("DERIV_APP_ID")
 
 SYMBOL        = "R_75"      # Volatility 75 Index
-GRANULARITY   = 3600        # candle size in seconds (3600 = 1 hour)
+GRANULARITY   = 300         # candle size in seconds (300 = 5 minutes)
 CANDLE_COUNT  = 110         # fetch extra so we have 100 closed candles after
                             # dropping the currently-forming one
 STAKE         = 10          # stake per trade in USD
