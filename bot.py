@@ -5,21 +5,20 @@ Strategy:
 - MACD(12, 26, 9): the MACD line crossing the signal line while BELOW the
   zero line signals a possible bullish reversal; crossing while ABOVE zero
   signals a possible bearish reversal.
-- Awesome Oscillator (AO): at least MIN_STREAK candles of one color, then a
-  flip to the opposite color confirms momentum has actually turned.
-- A trade is only placed when both the MACD condition and the AO flip agree
-  on the same closed candle.
+- Awesome Oscillator (AO): at least MIN_STREAK candles of the same color
+  (preceding the flip candle), then a color flip on the signal candle confirms
+  momentum has actually turned.
+- A trade is only placed when both conditions align on the same CLOSED candle.
 
 Authentication (new Deriv API v1):
-- Step 1: GET /trading/v1/options/accounts to auto-discover your demo account ID
-- Step 2: POST to the OTP endpoint with that account ID to get a one-time WebSocket URL
-- Step 3: Connect to that OTP URL to place authenticated trades
+- Step 1: GET /trading/v1/options/accounts to auto-discover demo account ID
+- Step 2: POST to the OTP endpoint ONLY when a signal fires (OTP is one-time/
+  short-lived, so we must request it fresh immediately before connecting)
+- Step 3: Connect to that OTP WebSocket URL and place the trade immediately
 
 Environment variables required (set in Railway → Variables tab):
   DERIV_API_TOKEN   Your Personal Access Token (PAT) from Deriv (needs trade scope)
   DERIV_APP_ID      Your Deriv App ID (from developers.deriv.com)
-
-NOTE: DERIV_ACCOUNT_ID is no longer needed — the bot finds it automatically.
 """
 
 import asyncio
@@ -38,7 +37,8 @@ APP_ID        = os.environ.get("DERIV_APP_ID")
 
 SYMBOL        = "R_75"      # Volatility 75 Index
 GRANULARITY   = 3600        # candle size in seconds (3600 = 1 hour)
-CANDLE_COUNT  = 100
+CANDLE_COUNT  = 110         # fetch extra so we have 100 closed candles after
+                            # dropping the currently-forming one
 STAKE         = 10          # stake per trade in USD
 DURATION      = 5
 DURATION_UNIT = "m"         # m = minutes
@@ -75,7 +75,6 @@ async def get_demo_account_id() -> str:
                     "same Deriv login as your demo Options account."
                 )
 
-            # Find the active demo account
             for acc in accounts:
                 if acc.get("account_type") == "demo" and acc.get("status") == "active":
                     account_id = acc["account_id"]
@@ -83,18 +82,24 @@ async def get_demo_account_id() -> str:
                           f"(balance: {acc['balance']} {acc['currency']})")
                     return account_id
 
-            # If no demo found, list what we got to help debugging
             print("Available accounts:")
             for acc in accounts:
-                print(f"  {acc.get('account_id')} | type: {acc.get('account_type')} | status: {acc.get('status')}")
+                print(f"  {acc.get('account_id')} | type: {acc.get('account_type')} "
+                      f"| status: {acc.get('status')}")
             raise RuntimeError("No active demo Options account found.")
 
 
-# ====== STEP 2: GET OTP URL ======
+# ====== STEP 2: GET FRESH OTP URL (called only when a signal fires) ======
 
-async def get_otp_url(account_id: str) -> str:
-    """Exchange the PAT for a one-time authenticated WebSocket URL."""
-    otp_endpoint = f"https://api.derivws.com/trading/v1/options/accounts/{account_id}/otp"
+async def get_fresh_otp_url(account_id: str) -> str:
+    """
+    Request a brand-new one-time WebSocket URL from the OTP endpoint.
+    Must be called immediately before connecting — the URL is short-lived
+    and single-use, so we never cache it between loop iterations.
+    """
+    otp_endpoint = (
+        f"https://api.derivws.com/trading/v1/options/accounts/{account_id}/otp"
+    )
     async with aiohttp.ClientSession() as session:
         async with session.post(otp_endpoint, headers=get_headers()) as resp:
             if resp.status != 200:
@@ -102,13 +107,19 @@ async def get_otp_url(account_id: str) -> str:
                 raise RuntimeError(f"OTP request failed ({resp.status}): {body}")
             data = await resp.json()
             otp_url = data["data"]["url"]
-            print(f"OTP URL obtained: {otp_url[:60]}...")
+            print(f"Fresh OTP URL obtained.")
             return otp_url
 
 
-# ====== STEP 3: FETCH CANDLES (public WS, no auth needed) ======
+# ====== STEP 3: FETCH CLOSED CANDLES (public WS, no auth needed) ======
 
-async def get_candles() -> list:
+async def get_closed_candles() -> list:
+    """
+    Fetch candles from the public WebSocket and drop the last one,
+    which is the currently-forming (unclosed) candle.
+    Returns only fully closed candles so signals are never based on
+    incomplete price data.
+    """
     request = {
         "ticks_history": SYMBOL,
         "adjust_start_time": 1,
@@ -122,7 +133,11 @@ async def get_candles() -> list:
         while True:
             response = json.loads(await ws.recv())
             if response.get("msg_type") == "candles":
-                return response["candles"]
+                candles = response["candles"]
+                # Drop the last candle — it is still forming
+                closed = candles[:-1]
+                print(f"Fetched {len(candles)} candles, using {len(closed)} closed.")
+                return closed
 
 
 def build_dataframe(candles: list) -> pd.DataFrame:
@@ -136,41 +151,64 @@ def build_dataframe(candles: list) -> pd.DataFrame:
 # ====== STEP 4: SIGNAL DETECTION ======
 
 def check_signal(df: pd.DataFrame):
-    macd_indicator = ta.trend.MACD(
+    """
+    Evaluate MACD + AO strategy on the most recent CLOSED candle.
+
+    Indexing convention (all indices are into the closed-candle DataFrame):
+      signal_candle  = iloc[-1]  → the most recently closed candle
+      prev_candle    = iloc[-2]  → the candle before that
+      streak_end     = iloc[-2]  → last candle of the preceding same-color run
+      streak_start   = iloc[-(MIN_STREAK+1)]  → earliest candle of that run
+
+    AO streak check: the MIN_STREAK candles BEFORE signal_candle
+    (i.e. iloc[-MIN_STREAK-1] through iloc[-2]) must all be the same color,
+    and signal_candle (iloc[-1]) must be the opposite color.
+    """
+    # --- MACD ---
+    macd_ind    = ta.trend.MACD(
         close=df["close"], window_slow=26, window_fast=12, window_sign=9
     )
-    macd_line   = macd_indicator.macd()
-    signal_line = macd_indicator.macd_signal()
+    macd_line   = macd_ind.macd()
+    signal_line = macd_ind.macd_signal()
 
-    ao_indicator = ta.momentum.AwesomeOscillatorIndicator(
+    # Cross on the signal candle: prev was on one side, last is on the other
+    macd_cross_up   = (macd_line.iloc[-2] < signal_line.iloc[-2] and
+                       macd_line.iloc[-1] > signal_line.iloc[-1])
+    macd_cross_down = (macd_line.iloc[-2] > signal_line.iloc[-2] and
+                       macd_line.iloc[-1] < signal_line.iloc[-1])
+
+    # Zone check uses prev_candle to confirm where MACD was before the cross
+    below_zero = macd_line.iloc[-2] < 0
+    above_zero = macd_line.iloc[-2] > 0
+
+    # --- AO ---
+    ao_ind = ta.momentum.AwesomeOscillatorIndicator(
         high=df["high"], low=df["low"]
     )
-    ao = ao_indicator.awesome_oscillator()
+    ao = ao_ind.awesome_oscillator()
 
+    # A bar is "green" when its AO value is higher than the previous bar's
     ao_green = ao > ao.shift(1)
 
-    last = -1
-    prev = -2
+    # The signal candle must flip color relative to the candle before it
+    ao_flip_to_green = (not ao_green.iloc[-2]) and ao_green.iloc[-1]
+    ao_flip_to_red   = ao_green.iloc[-2] and (not ao_green.iloc[-1])
 
-    macd_cross_up   = macd_line.iloc[prev] < signal_line.iloc[prev] and macd_line.iloc[last] > signal_line.iloc[last]
-    macd_cross_down = macd_line.iloc[prev] > signal_line.iloc[prev] and macd_line.iloc[last] < signal_line.iloc[last]
-    below_zero = macd_line.iloc[prev] < 0
-    above_zero = macd_line.iloc[prev] > 0
+    def had_streak_before_flip(streak_color_is_green: bool) -> bool:
+        """
+        Check that the MIN_STREAK candles immediately preceding the signal
+        candle (iloc[-MIN_STREAK-1] through iloc[-2]) are all streak_color.
+        These are the candles BEFORE the flip, not including the flip itself.
+        """
+        for i in range(-2, -MIN_STREAK - 2, -1):
+            if ao_green.iloc[i] != streak_color_is_green:
+                return False
+        return True
 
-    ao_flip_to_green = (not ao_green.iloc[prev]) and ao_green.iloc[last]
-    ao_flip_to_red   = ao_green.iloc[prev] and (not ao_green.iloc[last])
-
-    def had_streak(is_green: bool, start_index: int) -> bool:
-        count = 0
-        for i in range(start_index, start_index - MIN_STREAK, -1):
-            if ao_green.iloc[i] == is_green:
-                count += 1
-            else:
-                break
-        return count >= MIN_STREAK
-
-    bullish = macd_cross_up   and below_zero and ao_flip_to_green and had_streak(False, prev)
-    bearish = macd_cross_down and above_zero and ao_flip_to_red   and had_streak(True,  prev)
+    bullish = (macd_cross_up   and below_zero and
+               ao_flip_to_green and had_streak_before_flip(False))
+    bearish = (macd_cross_down and above_zero and
+               ao_flip_to_red   and had_streak_before_flip(True))
 
     if bullish:
         return "CALL"
@@ -179,9 +217,15 @@ def check_signal(df: pd.DataFrame):
     return None
 
 
-# ====== STEP 5: PLACE TRADE (authenticated WS) ======
+# ====== STEP 5: PLACE TRADE ======
 
-async def place_trade(otp_url: str, contract_type: str):
+async def place_trade(account_id: str, contract_type: str):
+    """
+    Request a fresh OTP URL, connect immediately, get a proposal, then buy.
+    The OTP is consumed in a single session — never stored between iterations.
+    """
+    otp_url = await get_fresh_otp_url(account_id)
+
     proposal_request = {
         "proposal": 1,
         "amount": STAKE,
@@ -229,35 +273,33 @@ async def main():
 
     print("Discovering demo Options account...")
     account_id = await get_demo_account_id()
-
-    print("Fetching OTP URL...")
-    otp_url = await get_otp_url(account_id)
-
     print("Bot started. Running strategy loop...")
 
     while True:
         try:
-            candles = await get_candles()
+            candles = await get_closed_candles()
             df = build_dataframe(candles)
 
-            if len(df) >= MIN_STREAK + 3:
+            min_required = MIN_STREAK + 5   # streak candles + MACD warmup buffer
+            if len(df) < min_required:
+                print(f"Not enough closed candles yet "
+                      f"({len(df)} / {min_required} needed).")
+            else:
                 signal = check_signal(df)
                 if signal:
-                    print(f"Signal detected: {signal} — placing trade...")
-                    await place_trade(otp_url, signal)
+                    print(f"Signal detected: {signal} — requesting fresh OTP and placing trade...")
+                    await place_trade(account_id, signal)
                 else:
-                    print("No signal this candle.")
-            else:
-                print(f"Not enough candles yet ({len(df)} / {MIN_STREAK + 3} needed).")
+                    print("No signal on this closed candle.")
 
         except Exception as e:
             print(f"Error in main loop: {e}")
+            # Re-discover account on any failure (e.g. network blip)
             try:
-                print("Re-discovering account and refreshing OTP URL...")
+                print("Re-discovering demo account...")
                 account_id = await get_demo_account_id()
-                otp_url = await get_otp_url(account_id)
             except Exception as refresh_err:
-                print(f"Failed to refresh: {refresh_err}")
+                print(f"Failed to re-discover account: {refresh_err}")
 
         await asyncio.sleep(GRANULARITY)
 
