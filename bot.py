@@ -11,17 +11,15 @@ Strategy:
   on the same closed candle.
 
 Authentication (new Deriv API v1):
-- Step 1: POST to the OTP endpoint with your Bearer token to get a one-time
-  WebSocket URL.
-- Step 2: Connect to that OTP URL to place authenticated trades.
-- Public market data (candles) uses the public WebSocket — no auth needed.
+- Step 1: GET /trading/v1/options/accounts to auto-discover your demo account ID
+- Step 2: POST to the OTP endpoint with that account ID to get a one-time WebSocket URL
+- Step 3: Connect to that OTP URL to place authenticated trades
 
 Environment variables required (set in Railway → Variables tab):
-  DERIV_API_TOKEN   Your Personal Access Token (PAT) from Deriv
-  DERIV_APP_ID      Your Deriv App ID (create one at developers.deriv.com)
-  DERIV_ACCOUNT_ID  Your Deriv account ID (e.g. CR123456)
+  DERIV_API_TOKEN   Your Personal Access Token (PAT) from Deriv (needs trade scope)
+  DERIV_APP_ID      Your Deriv App ID (from developers.deriv.com)
 
-IMPORTANT: Never hardcode tokens in this file — this repo is public on GitHub.
+NOTE: DERIV_ACCOUNT_ID is no longer needed — the bot finds it automatically.
 """
 
 import asyncio
@@ -35,34 +33,70 @@ import pandas as pd
 import ta
 
 # ====== CONFIG ======
-API_TOKEN    = os.environ.get("DERIV_API_TOKEN")    # Personal Access Token (PAT)
-APP_ID       = os.environ.get("DERIV_APP_ID")       # Your Deriv App ID
-ACCOUNT_ID   = os.environ.get("DERIV_ACCOUNT_ID")   # e.g. CR123456
+API_TOKEN     = os.environ.get("DERIV_API_TOKEN")
+APP_ID        = os.environ.get("DERIV_APP_ID")
 
-SYMBOL       = "R_75"      # Volatility 75 Index. Change to e.g. "frxEURUSD" for forex
-GRANULARITY  = 3600        # candle size in seconds (3600 = 1 hour)
-CANDLE_COUNT = 100         # how many historical candles to keep in memory
-STAKE        = 10          # stake per trade in USD
-DURATION     = 5
-DURATION_UNIT = "m"        # m = minutes, s = seconds, h = hours, d = days, t = ticks
-MIN_STREAK   = 5           # minimum consecutive same-colour AO bars before a flip counts
+SYMBOL        = "R_75"      # Volatility 75 Index
+GRANULARITY   = 3600        # candle size in seconds (3600 = 1 hour)
+CANDLE_COUNT  = 100
+STAKE         = 10          # stake per trade in USD
+DURATION      = 5
+DURATION_UNIT = "m"         # m = minutes
+MIN_STREAK    = 5
 
-# Deriv API v1 endpoints
-OTP_ENDPOINT   = f"https://api.derivws.com/trading/v1/options/accounts/{ACCOUNT_ID}/otp"
-PUBLIC_WS_URL  = "wss://api.derivws.com/trading/v1/options/ws/public"
+ACCOUNTS_ENDPOINT = "https://api.derivws.com/trading/v1/options/accounts"
+PUBLIC_WS_URL     = "wss://api.derivws.com/trading/v1/options/ws/public"
 
 
-# ====== STEP 1: GET OTP URL ======
-
-async def get_otp_url() -> str:
-    """Exchange the PAT for a one-time authenticated WebSocket URL."""
-    headers = {
+def get_headers():
+    return {
         "Authorization": f"Bearer {API_TOKEN}",
-        "Deriv-App-ID": APP_ID,
+        "Deriv-App-ID": str(APP_ID),
         "Content-Type": "application/json",
     }
+
+
+# ====== STEP 1: AUTO-DISCOVER DEMO ACCOUNT ID ======
+
+async def get_demo_account_id() -> str:
+    """Call the accounts list endpoint and find the demo Options account ID."""
     async with aiohttp.ClientSession() as session:
-        async with session.post(OTP_ENDPOINT, headers=headers) as resp:
+        async with session.get(ACCOUNTS_ENDPOINT, headers=get_headers()) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                raise RuntimeError(f"Accounts request failed ({resp.status}): {body}")
+            data = await resp.json()
+            accounts = data.get("data", [])
+
+            if not accounts:
+                raise RuntimeError(
+                    "No Options accounts found for these credentials. "
+                    "Make sure your PAT has the 'trade' scope and belongs to the "
+                    "same Deriv login as your demo Options account."
+                )
+
+            # Find the active demo account
+            for acc in accounts:
+                if acc.get("account_type") == "demo" and acc.get("status") == "active":
+                    account_id = acc["account_id"]
+                    print(f"Found demo Options account: {account_id} "
+                          f"(balance: {acc['balance']} {acc['currency']})")
+                    return account_id
+
+            # If no demo found, list what we got to help debugging
+            print("Available accounts:")
+            for acc in accounts:
+                print(f"  {acc.get('account_id')} | type: {acc.get('account_type')} | status: {acc.get('status')}")
+            raise RuntimeError("No active demo Options account found.")
+
+
+# ====== STEP 2: GET OTP URL ======
+
+async def get_otp_url(account_id: str) -> str:
+    """Exchange the PAT for a one-time authenticated WebSocket URL."""
+    otp_endpoint = f"https://api.derivws.com/trading/v1/options/accounts/{account_id}/otp"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(otp_endpoint, headers=get_headers()) as resp:
             if resp.status != 200:
                 body = await resp.text()
                 raise RuntimeError(f"OTP request failed ({resp.status}): {body}")
@@ -72,10 +106,9 @@ async def get_otp_url() -> str:
             return otp_url
 
 
-# ====== STEP 2: FETCH CANDLES (public WS, no auth needed) ======
+# ====== STEP 3: FETCH CANDLES (public WS, no auth needed) ======
 
 async def get_candles() -> list:
-    """Fetch historical candles from the public WebSocket endpoint."""
     request = {
         "ticks_history": SYMBOL,
         "adjust_start_time": 1,
@@ -100,7 +133,7 @@ def build_dataframe(candles: list) -> pd.DataFrame:
     return df
 
 
-# ====== STEP 3: SIGNAL DETECTION ======
+# ====== STEP 4: SIGNAL DETECTION ======
 
 def check_signal(df: pd.DataFrame):
     macd_indicator = ta.trend.MACD(
@@ -114,7 +147,6 @@ def check_signal(df: pd.DataFrame):
     )
     ao = ao_indicator.awesome_oscillator()
 
-    # AO "green" = higher than previous bar, "red" = lower
     ao_green = ao > ao.shift(1)
 
     last = -1
@@ -147,15 +179,9 @@ def check_signal(df: pd.DataFrame):
     return None
 
 
-# ====== STEP 4: PLACE TRADE (authenticated WS) ======
+# ====== STEP 5: PLACE TRADE (authenticated WS) ======
 
 async def place_trade(otp_url: str, contract_type: str):
-    """
-    Correct Deriv v1 trade flow:
-      1. Connect to the OTP WebSocket URL.
-      2. Send a proposal request — get back a proposal ID and ask_price.
-      3. Send a buy request using that proposal ID and ask_price.
-    """
     proposal_request = {
         "proposal": 1,
         "amount": STAKE,
@@ -164,11 +190,10 @@ async def place_trade(otp_url: str, contract_type: str):
         "currency": "USD",
         "duration": DURATION,
         "duration_unit": DURATION_UNIT,
-        "underlying_symbol": SYMBOL,   # new field name in v1 API
+        "underlying_symbol": SYMBOL,
     }
 
     async with websockets.connect(otp_url) as ws:
-        # --- Get proposal ---
         await ws.send(json.dumps(proposal_request))
         while True:
             msg = json.loads(await ws.recv())
@@ -181,7 +206,6 @@ async def place_trade(otp_url: str, contract_type: str):
                 print(f"Proposal received — ID: {proposal_id}, Ask: {ask_price}")
                 break
 
-        # --- Buy using proposal ID ---
         buy_request = {
             "buy": proposal_id,
             "price": ask_price,
@@ -197,15 +221,18 @@ async def place_trade(otp_url: str, contract_type: str):
 # ====== MAIN LOOP ======
 
 async def main():
-    # Validate environment variables
-    missing = [v for v in ("DERIV_API_TOKEN", "DERIV_APP_ID", "DERIV_ACCOUNT_ID") if not os.environ.get(v)]
+    missing = [v for v in ("DERIV_API_TOKEN", "DERIV_APP_ID") if not os.environ.get(v)]
     if missing:
         print(f"ERROR: Missing environment variable(s): {', '.join(missing)}")
         print("Set them in Railway under your service's Variables tab.")
         sys.exit(1)
 
+    print("Discovering demo Options account...")
+    account_id = await get_demo_account_id()
+
     print("Fetching OTP URL...")
-    otp_url = await get_otp_url()
+    otp_url = await get_otp_url(account_id)
+
     print("Bot started. Running strategy loop...")
 
     while True:
@@ -225,12 +252,12 @@ async def main():
 
         except Exception as e:
             print(f"Error in main loop: {e}")
-            # Re-fetch OTP URL on error in case the session expired
             try:
-                print("Re-fetching OTP URL after error...")
-                otp_url = await get_otp_url()
-            except Exception as otp_err:
-                print(f"Failed to refresh OTP URL: {otp_err}")
+                print("Re-discovering account and refreshing OTP URL...")
+                account_id = await get_demo_account_id()
+                otp_url = await get_otp_url(account_id)
+            except Exception as refresh_err:
+                print(f"Failed to refresh: {refresh_err}")
 
         await asyncio.sleep(GRANULARITY)
 
