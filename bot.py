@@ -1,7 +1,7 @@
 """
 Deriv MACD + Awesome Oscillator Reversal Bot  (API v1)
 -------------------------------------------------------
-Strategy:
+Strategy (run independently per symbol):
 - MACD(12, 26, 9): the MACD line crossing the signal line while BELOW the
   zero line signals a possible bullish reversal; crossing while ABOVE zero
   signals a possible bearish reversal.
@@ -9,6 +9,12 @@ Strategy:
   (preceding the flip candle), then a color flip on the signal candle confirms
   momentum has actually turned.
 - A trade is only placed when both conditions align on the same CLOSED candle.
+
+Multi-symbol:
+- The bot now runs the same strategy concurrently and independently on
+  Volatility 25, Volatility 75, and Volatility 100 Indices. Each symbol has
+  its own candle fetch, signal check, and duplicate-candle protection so a
+  signal on one symbol never affects another.
 
 Authentication (new Deriv API v1):
 - Step 1: GET /trading/v1/options/accounts to auto-discover demo account ID
@@ -35,9 +41,9 @@ import ta
 API_TOKEN     = os.environ.get("DERIV_API_TOKEN")
 APP_ID        = os.environ.get("DERIV_APP_ID")
 
-SYMBOL        = "R_75"      # Volatility 75 Index
+SYMBOLS       = ["R_25", "R_75", "R_100"]   # Volatility 25 / 75 / 100 Indices
 GRANULARITY   = 300         # candle size in seconds (300 = 5 minutes)
-CANDLE_COUNT  = 110         # fetch extra so we have 100 closed candles after
+CANDLE_COUNT  = 110         # fetch extra so we have ~100+ closed candles after
                             # dropping the currently-forming one
 STAKE         = 10          # stake per trade in USD
 DURATION      = 5
@@ -113,15 +119,15 @@ async def get_fresh_otp_url(account_id: str) -> str:
 
 # ====== STEP 3: FETCH CLOSED CANDLES (public WS, no auth needed) ======
 
-async def get_closed_candles() -> list:
+async def get_closed_candles(symbol: str) -> list:
     """
-    Fetch candles from the public WebSocket and drop the last one,
-    which is the currently-forming (unclosed) candle.
+    Fetch candles for a given symbol from the public WebSocket and drop the
+    last one, which is the currently-forming (unclosed) candle.
     Returns only fully closed candles so signals are never based on
     incomplete price data.
     """
     request = {
-        "ticks_history": SYMBOL,
+        "ticks_history": symbol,
         "adjust_start_time": 1,
         "count": CANDLE_COUNT,
         "end": "latest",
@@ -132,11 +138,16 @@ async def get_closed_candles() -> list:
         await ws.send(json.dumps(request))
         while True:
             response = json.loads(await ws.recv())
+            if "error" in response:
+                raise RuntimeError(
+                    response["error"].get("message", "Unknown Deriv error")
+                )
             if response.get("msg_type") == "candles":
                 candles = response["candles"]
                 # Drop the last candle — it is still forming
                 closed = candles[:-1]
-                print(f"Fetched {len(candles)} candles, using {len(closed)} closed.")
+                print(f"[{symbol}] Fetched {len(candles)} candles, "
+                      f"using {len(closed)} closed.")
                 return closed
 
 
@@ -155,15 +166,20 @@ def check_signal(df: pd.DataFrame):
     Evaluate MACD + AO strategy on the most recent CLOSED candle.
 
     Indexing convention (all indices are into the closed-candle DataFrame):
-      signal_candle  = iloc[-1]  → the most recently closed candle
-      prev_candle    = iloc[-2]  → the candle before that
-      streak_end     = iloc[-2]  → last candle of the preceding same-color run
-      streak_start   = iloc[-(MIN_STREAK+1)]  → earliest candle of that run
+      signal_candle  = iloc[-1]  -> the most recently closed candle
+      prev_candle    = iloc[-2]  -> the candle before that
+      streak_end     = iloc[-2]  -> last candle of the preceding same-color run
+      streak_start   = iloc[-(MIN_STREAK+1)]  -> earliest candle of that run
 
     AO streak check: the MIN_STREAK candles BEFORE signal_candle
     (i.e. iloc[-MIN_STREAK-1] through iloc[-2]) must all be the same color,
     and signal_candle (iloc[-1]) must be the opposite color.
+
+    Returns a tuple (signal, candle_epoch) where signal is "CALL"/"PUT"/None
+    and candle_epoch is the epoch of the signal candle (for dedup tracking).
     """
+    signal_epoch = df.iloc[-1]["epoch"] if "epoch" in df.columns else None
+
     # --- MACD ---
     macd_ind    = ta.trend.MACD(
         close=df["close"], window_slow=26, window_fast=12, window_sign=9
@@ -211,15 +227,15 @@ def check_signal(df: pd.DataFrame):
                ao_flip_to_red   and had_streak_before_flip(True))
 
     if bullish:
-        return "CALL"
+        return "CALL", signal_epoch
     if bearish:
-        return "PUT"
-    return None
+        return "PUT", signal_epoch
+    return None, signal_epoch
 
 
 # ====== STEP 5: PLACE TRADE ======
 
-async def place_trade(account_id: str, contract_type: str):
+async def place_trade(account_id: str, symbol: str, contract_type: str):
     """
     Request a fresh OTP URL, connect immediately, get a proposal, then buy.
     The OTP is consumed in a single session — never stored between iterations.
@@ -234,7 +250,7 @@ async def place_trade(account_id: str, contract_type: str):
         "currency": "USD",
         "duration": DURATION,
         "duration_unit": DURATION_UNIT,
-        "underlying_symbol": SYMBOL,
+        "underlying_symbol": symbol,
     }
 
     async with websockets.connect(otp_url) as ws:
@@ -243,11 +259,12 @@ async def place_trade(account_id: str, contract_type: str):
             msg = json.loads(await ws.recv())
             if msg.get("msg_type") == "proposal":
                 if "error" in msg:
-                    print("Proposal error:", msg["error"]["message"])
+                    print(f"[{symbol}] Proposal error:", msg["error"]["message"])
                     return
                 proposal_id = msg["proposal"]["id"]
                 ask_price   = msg["proposal"]["ask_price"]
-                print(f"Proposal received — ID: {proposal_id}, Ask: {ask_price}")
+                print(f"[{symbol}] Proposal received — ID: {proposal_id}, "
+                      f"Ask: {ask_price}")
                 break
 
         buy_request = {
@@ -257,12 +274,57 @@ async def place_trade(account_id: str, contract_type: str):
         await ws.send(json.dumps(buy_request))
         buy_response = json.loads(await ws.recv())
         if "error" in buy_response:
-            print("Buy error:", buy_response["error"]["message"])
+            print(f"[{symbol}] Buy error:", buy_response["error"]["message"])
         else:
-            print("Trade placed successfully:", buy_response)
+            print(f"[{symbol}] Trade placed successfully:", buy_response)
 
 
-# ====== MAIN LOOP ======
+# ====== PER-SYMBOL STRATEGY LOOP ======
+
+async def run_symbol_loop(symbol: str, account_id_holder: dict):
+    """
+    Independent strategy loop for a single symbol. Runs forever, checking
+    for a signal every GRANULARITY seconds. Tracks the epoch of the last
+    candle that triggered a trade so the same closed candle is never traded
+    twice (duplicate-candle protection).
+    """
+    last_traded_epoch = None
+
+    while True:
+        try:
+            candles = await get_closed_candles(symbol)
+            df = build_dataframe(candles)
+
+            min_required = MIN_STREAK + 5   # streak candles + MACD warmup buffer
+            if len(df) < min_required:
+                print(f"[{symbol}] Not enough closed candles yet "
+                      f"({len(df)} / {min_required} needed).")
+            else:
+                signal, signal_epoch = check_signal(df)
+                if signal and signal_epoch == last_traded_epoch:
+                    print(f"[{symbol}] Signal {signal} already traded for this "
+                          f"candle (epoch {signal_epoch}), skipping.")
+                elif signal:
+                    print(f"[{symbol}] Signal detected: {signal} — "
+                          f"requesting fresh OTP and placing trade...")
+                    await place_trade(account_id_holder["id"], symbol, signal)
+                    last_traded_epoch = signal_epoch
+                else:
+                    print(f"[{symbol}] No signal on this closed candle.")
+
+        except Exception as e:
+            print(f"[{symbol}] Error in strategy loop: {e}")
+            # Re-discover account on any failure (e.g. network blip)
+            try:
+                print(f"[{symbol}] Re-discovering demo account...")
+                account_id_holder["id"] = await get_demo_account_id()
+            except Exception as refresh_err:
+                print(f"[{symbol}] Failed to re-discover account: {refresh_err}")
+
+        await asyncio.sleep(GRANULARITY)
+
+
+# ====== MAIN ======
 
 async def main():
     missing = [v for v in ("DERIV_API_TOKEN", "DERIV_APP_ID") if not os.environ.get(v)]
@@ -273,35 +335,15 @@ async def main():
 
     print("Discovering demo Options account...")
     account_id = await get_demo_account_id()
-    print("Bot started. Running strategy loop...")
+    # Shared mutable holder so all symbol loops see account_id refreshes
+    account_id_holder = {"id": account_id}
 
-    while True:
-        try:
-            candles = await get_closed_candles()
-            df = build_dataframe(candles)
+    print(f"Bot started. Running strategy loop on: {', '.join(SYMBOLS)}")
 
-            min_required = MIN_STREAK + 5   # streak candles + MACD warmup buffer
-            if len(df) < min_required:
-                print(f"Not enough closed candles yet "
-                      f"({len(df)} / {min_required} needed).")
-            else:
-                signal = check_signal(df)
-                if signal:
-                    print(f"Signal detected: {signal} — requesting fresh OTP and placing trade...")
-                    await place_trade(account_id, signal)
-                else:
-                    print("No signal on this closed candle.")
-
-        except Exception as e:
-            print(f"Error in main loop: {e}")
-            # Re-discover account on any failure (e.g. network blip)
-            try:
-                print("Re-discovering demo account...")
-                account_id = await get_demo_account_id()
-            except Exception as refresh_err:
-                print(f"Failed to re-discover account: {refresh_err}")
-
-        await asyncio.sleep(GRANULARITY)
+    # Run one independent strategy loop per symbol, concurrently
+    await asyncio.gather(*[
+        run_symbol_loop(symbol, account_id_holder) for symbol in SYMBOLS
+    ])
 
 
 if __name__ == "__main__":
