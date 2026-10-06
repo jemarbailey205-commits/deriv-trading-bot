@@ -50,6 +50,15 @@ DURATION      = 5
 DURATION_UNIT = "m"         # m = minutes
 MIN_STREAK    = 5
 
+# --- Price structure filter ---
+# A signal is only confirmed if the closing price of the signal candle is
+# within STRUCTURE_PROXIMITY_PCT of a recent swing low (for CALL) or swing
+# high (for PUT), calculated over the STRUCTURE_LOOKBACK candles preceding
+# the signal candle. This avoids taking reversal trades in the middle of a
+# range, where MACD/AO can flip without real support or resistance behind it.
+STRUCTURE_LOOKBACK       = 25     # candles to look back for swing high/low
+STRUCTURE_PROXIMITY_PCT  = 0.5    # must be within this % of the swing level
+
 ACCOUNTS_ENDPOINT = "https://api.derivws.com/trading/v1/options/accounts"
 PUBLIC_WS_URL     = "wss://api.derivws.com/trading/v1/options/ws/public"
 
@@ -161,6 +170,31 @@ def build_dataframe(candles: list) -> pd.DataFrame:
 
 # ====== STEP 4: SIGNAL DETECTION ======
 
+def near_structure_level(df: pd.DataFrame, direction: str) -> bool:
+    """
+    Check whether the signal candle's close is near a recent swing low
+    (direction='CALL', i.e. testing support) or swing high
+    (direction='PUT', i.e. testing resistance), using the
+    STRUCTURE_LOOKBACK candles immediately preceding the signal candle
+    (not including the signal candle itself, so the level isn't
+    contaminated by the candle we're judging).
+    """
+    window = df.iloc[-(STRUCTURE_LOOKBACK + 1):-1]
+    if len(window) < STRUCTURE_LOOKBACK:
+        return False  # not enough history to establish structure yet
+
+    signal_close = df["close"].iloc[-1]
+
+    if direction == "CALL":
+        swing_low = window["low"].min()
+        distance_pct = abs(signal_close - swing_low) / swing_low * 100
+        return distance_pct <= STRUCTURE_PROXIMITY_PCT
+    else:  # PUT
+        swing_high = window["high"].max()
+        distance_pct = abs(swing_high - signal_close) / swing_high * 100
+        return distance_pct <= STRUCTURE_PROXIMITY_PCT
+
+
 def check_signal(df: pd.DataFrame):
     """
     Evaluate MACD + AO strategy on the most recent CLOSED candle.
@@ -226,10 +260,32 @@ def check_signal(df: pd.DataFrame):
     bearish = (macd_cross_down and above_zero and
                ao_flip_to_red   and had_streak_before_flip(True))
 
-    if bullish:
+    # --- Price structure filter ---
+    # Look at the STRUCTURE_LOOKBACK candles before the signal candle.
+    # For a CALL: closing price must be within STRUCTURE_PROXIMITY_PCT of the
+    #             recent swing LOW (near support).
+    # For a PUT:  closing price must be within STRUCTURE_PROXIMITY_PCT of the
+    #             recent swing HIGH (near resistance).
+    close_price  = df["close"].iloc[-1]
+    lookback_df  = df.iloc[-(STRUCTURE_LOOKBACK + 1):-1]  # exclude signal candle
+    swing_low    = lookback_df["low"].min()
+    swing_high   = lookback_df["high"].max()
+
+    near_support    = close_price <= swing_low  * (1 + STRUCTURE_PROXIMITY_PCT / 100)
+    near_resistance = close_price >= swing_high * (1 - STRUCTURE_PROXIMITY_PCT / 100)
+
+    if bullish and near_support:
         return "CALL", signal_epoch
-    if bearish:
+    elif bullish:
+        print(f"  CALL signal found but price ({close_price:.4f}) not near "
+              f"support ({swing_low:.4f}), skipping.")
+
+    if bearish and near_resistance:
         return "PUT", signal_epoch
+    elif bearish:
+        print(f"  PUT signal found but price ({close_price:.4f}) not near "
+              f"resistance ({swing_high:.4f}), skipping.")
+
     return None, signal_epoch
 
 
