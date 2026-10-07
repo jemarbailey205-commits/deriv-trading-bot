@@ -42,7 +42,7 @@ API_TOKEN     = os.environ.get("DERIV_API_TOKEN")
 APP_ID        = os.environ.get("DERIV_APP_ID")
 
 SYMBOLS       = ["R_25", "R_75", "R_100"]   # Volatility 25 / 75 / 100 Indices
-GRANULARITY   = 900         # candle size in seconds (900 = 15 minutes)
+GRANULARITY   = 300         # candle size in seconds (300 = 5 minutes)
 CANDLE_COUNT  = 110         # fetch extra so we have ~100+ closed candles after
                             # dropping the currently-forming one
 STAKE         = 10          # stake per trade in USD
@@ -57,7 +57,7 @@ MIN_STREAK    = 5
 # the signal candle. This avoids taking reversal trades in the middle of a
 # range, where MACD/AO can flip without real support or resistance behind it.
 STRUCTURE_LOOKBACK       = 25     # candles to look back for swing high/low
-STRUCTURE_PROXIMITY_PCT  = 0.5    # must be within this % of the swing level
+STRUCTURE_PROXIMITY_PCT  = 1.0    # must be within this % of the swing level
 
 ACCOUNTS_ENDPOINT = "https://api.derivws.com/trading/v1/options/accounts"
 PUBLIC_WS_URL     = "wss://api.derivws.com/trading/v1/options/ws/public"
