@@ -6,8 +6,10 @@ Strategy (run independently per symbol):
   the recent swing high (bullish) or swing low (bearish), measured over
   the STRUCTURE_LOOKBACK candles BEFORE the signal candle. This is a real
   break, not just proximity to the level.
-- Momentum confirmation: AO or AC (at least one) must cross the zero line
-  on the signal candle, in the same direction as the break.
+- Momentum confirmation: AO or AC (at least one) must have crossed the zero
+  line in the same direction as the break, either on the signal candle itself
+  or up to ZERO_CROSS_WINDOW candles before it. The indicator that crossed
+  must still be on the correct side of zero on the signal candle.
 - A trade is only placed when both conditions align on the same CLOSED candle.
 
 Timeframe: 15-minute candles.
@@ -43,8 +45,10 @@ DURATION      = 5
 DURATION_UNIT = "m"
 
 # --- AO / AC settings ---
-AC_SMA_PERIOD = 5            # AC = AO - SMA(AO, 5)  (standard Bill Williams)
-MIN_CANDLES   = 50           # AO needs 34, AC needs ~38; extra buffer
+AC_SMA_PERIOD     = 5        # AC = AO - SMA(AO, 5)  (standard Bill Williams)
+ZERO_CROSS_WINDOW = 2        # zero cross may be on the signal candle or up to
+                             # this many candles before it
+MIN_CANDLES       = 50       # AO needs 34, AC needs ~38; extra buffer
 
 # --- Structure filter ---
 STRUCTURE_LOOKBACK = 25      # candles to look back for swing high/low
@@ -149,12 +153,34 @@ def build_dataframe(candles: list) -> pd.DataFrame:
 
 # ====== INDICATOR HELPERS ======
 
-def crossed_up(series: pd.Series) -> bool:
-    return series.iloc[-2] <= 0 < series.iloc[-1]
+def crossed_up_within(series: pd.Series, window: int) -> bool:
+    """
+    True if the series crossed from <= 0 to > 0 on the signal candle or on
+    any of the `window` candles before it, AND is still above zero on the
+    signal candle (so a cross that has already reversed doesn't count).
+    """
+    if not series.iloc[-1] > 0:
+        return False
+    for k in range(window + 1):
+        idx = -1 - k
+        if series.iloc[idx - 1] <= 0 < series.iloc[idx]:
+            return True
+    return False
 
 
-def crossed_down(series: pd.Series) -> bool:
-    return series.iloc[-2] >= 0 > series.iloc[-1]
+def crossed_down_within(series: pd.Series, window: int) -> bool:
+    """
+    True if the series crossed from >= 0 to < 0 on the signal candle or on
+    any of the `window` candles before it, AND is still below zero on the
+    signal candle.
+    """
+    if not series.iloc[-1] < 0:
+        return False
+    for k in range(window + 1):
+        idx = -1 - k
+        if series.iloc[idx - 1] >= 0 > series.iloc[idx]:
+            return True
+    return False
 
 
 def broke_resistance(df: pd.DataFrame) -> bool:
@@ -179,10 +205,12 @@ def check_signal(df: pd.DataFrame):
     """
     Returns (signal, candle_epoch): signal is "CALL" / "PUT" / None.
 
-    CALL: close breaks above the recent swing high AND AO or AC crosses
-          up through zero on the same candle.
-    PUT:  close breaks below the recent swing low AND AO or AC crosses
-          down through zero on the same candle.
+    CALL: close breaks above the recent swing high AND AO or AC crossed up
+          through zero on the signal candle or within the previous
+          ZERO_CROSS_WINDOW candles (and is still above zero).
+    PUT:  close breaks below the recent swing low AND AO or AC crossed down
+          through zero on the signal candle or within the previous
+          ZERO_CROSS_WINDOW candles (and is still below zero).
     """
     signal_epoch = df.iloc[-1]["epoch"] if "epoch" in df.columns else None
 
@@ -191,8 +219,10 @@ def check_signal(df: pd.DataFrame):
     ).awesome_oscillator()
     ac = ao - ao.rolling(AC_SMA_PERIOD).mean()
 
-    momentum_up   = crossed_up(ao) or crossed_up(ac)
-    momentum_down = crossed_down(ao) or crossed_down(ac)
+    momentum_up = (crossed_up_within(ao, ZERO_CROSS_WINDOW) or
+                   crossed_up_within(ac, ZERO_CROSS_WINDOW))
+    momentum_down = (crossed_down_within(ao, ZERO_CROSS_WINDOW) or
+                     crossed_down_within(ac, ZERO_CROSS_WINDOW))
 
     close_price = df["close"].iloc[-1]
 
