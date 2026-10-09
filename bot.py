@@ -4,13 +4,14 @@ Deriv AO + AC Breakout Bot  (API v1)
 Strategy (run independently per symbol):
 - Structure break: the signal candle's close must actually break outside
   the recent swing high (bullish) or swing low (bearish), measured over
-  the STRUCTURE_LOOKBACK candles BEFORE the signal candle. This is a real
-  break, not just proximity to the level.
+  the STRUCTURE_LOOKBACK candles BEFORE the signal candle.
 - Momentum confirmation: AO or AC (at least one) must have crossed the zero
   line in the same direction as the break, either on the signal candle itself
   or up to ZERO_CROSS_WINDOW candles before it. The indicator that crossed
   must still be on the correct side of zero on the signal candle.
 - A trade is only placed when both conditions align on the same CLOSED candle.
+- Rest period: no trades are placed between REST_START and REST_END
+  (default: Friday 6 PM to Saturday 6 PM, Jamaica time).
 
 Timeframe: 15-minute candles.
 
@@ -27,11 +28,17 @@ import json
 import os
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 
 import aiohttp
 import websockets
 import pandas as pd
 import ta
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
 
 # ====== CONFIG ======
 API_TOKEN     = os.environ.get("DERIV_API_TOKEN")
@@ -53,6 +60,16 @@ MIN_CANDLES       = 50       # AO needs 34, AC needs ~38; extra buffer
 # --- Structure filter ---
 STRUCTURE_LOOKBACK = 25      # candles to look back for swing high/low
 
+# --- Rest period filter ---
+# No trades between REST_START and REST_END (local time in REST_TIMEZONE).
+# Days: Monday=0 ... Friday=4, Saturday=5, Sunday=6. Hours are 24-hour clock.
+REST_ENABLED    = True
+REST_TIMEZONE   = "America/Jamaica"   # UTC-5, no daylight saving
+REST_START_DAY  = 4                   # Friday
+REST_START_HOUR = 18                  # 6 PM
+REST_END_DAY    = 5                   # Saturday
+REST_END_HOUR   = 18                  # 6 PM
+
 # --- Timing / robustness ---
 CANDLE_CLOSE_DELAY = 2       # seconds after the boundary before checking
 WS_TIMEOUT         = 15      # seconds to wait for any WebSocket reply
@@ -67,6 +84,35 @@ def get_headers():
         "Deriv-App-ID": str(APP_ID),
         "Content-Type": "application/json",
     }
+
+
+# ====== REST PERIOD FILTER ======
+
+def _local_now() -> datetime:
+    """Current time in REST_TIMEZONE. Falls back to fixed UTC-5 if the
+    timezone database isn't available on the server."""
+    if ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo(REST_TIMEZONE))
+        except Exception:
+            pass
+    return datetime.now(timezone(timedelta(hours=-5)))
+
+
+def is_rest_period() -> bool:
+    """True if the current local time falls inside the rest window."""
+    if not REST_ENABLED:
+        return False
+
+    now = _local_now()
+    now_min   = now.weekday() * 1440 + now.hour * 60 + now.minute
+    start_min = REST_START_DAY * 1440 + REST_START_HOUR * 60
+    end_min   = REST_END_DAY * 1440 + REST_END_HOUR * 60
+
+    if start_min <= end_min:
+        return start_min <= now_min < end_min
+    # Window wraps around the end of the week (e.g. Sunday -> Monday)
+    return now_min >= start_min or now_min < end_min
 
 
 # ====== ACCOUNT DISCOVERY ======
@@ -157,7 +203,7 @@ def crossed_up_within(series: pd.Series, window: int) -> bool:
     """
     True if the series crossed from <= 0 to > 0 on the signal candle or on
     any of the `window` candles before it, AND is still above zero on the
-    signal candle (so a cross that has already reversed doesn't count).
+    signal candle.
     """
     if not series.iloc[-1] > 0:
         return False
@@ -296,34 +342,38 @@ async def run_symbol_loop(symbol: str, account_id_holder: dict):
 
     while True:
         try:
-            candles = await get_closed_candles(symbol)
-            df = build_dataframe(candles)
-
-            if len(df) < MIN_CANDLES:
-                print(f"[{symbol}] Not enough closed candles "
-                      f"({len(df)} / {MIN_CANDLES} needed).")
+            if is_rest_period():
+                print(f"[{symbol}] Rest period active, skipping this candle.")
             else:
-                signal, signal_epoch = check_signal(df)
-                if signal and signal_epoch == last_traded_epoch:
-                    print(f"[{symbol}] Signal {signal} already traded for "
-                          f"epoch {signal_epoch}, skipping.")
-                elif signal:
-                    print(f"[{symbol}] Signal detected: {signal} - placing trade...")
-                    try:
-                        ok = await place_trade(
-                            account_id_holder["id"], symbol, signal
-                        )
-                        if ok:
-                            last_traded_epoch = signal_epoch
-                    except Exception as trade_err:
-                        print(f"[{symbol}] Trade error: {trade_err}")
-                        try:
-                            account_id_holder["id"] = await get_demo_account_id()
-                        except Exception as refresh_err:
-                            print(f"[{symbol}] Account re-discovery failed: "
-                                  f"{refresh_err}")
+                candles = await get_closed_candles(symbol)
+                df = build_dataframe(candles)
+
+                if len(df) < MIN_CANDLES:
+                    print(f"[{symbol}] Not enough closed candles "
+                          f"({len(df)} / {MIN_CANDLES} needed).")
                 else:
-                    print(f"[{symbol}] No signal on this closed candle.")
+                    signal, signal_epoch = check_signal(df)
+                    if signal and signal_epoch == last_traded_epoch:
+                        print(f"[{symbol}] Signal {signal} already traded for "
+                              f"epoch {signal_epoch}, skipping.")
+                    elif signal:
+                        print(f"[{symbol}] Signal detected: {signal} - "
+                              f"placing trade...")
+                        try:
+                            ok = await place_trade(
+                                account_id_holder["id"], symbol, signal
+                            )
+                            if ok:
+                                last_traded_epoch = signal_epoch
+                        except Exception as trade_err:
+                            print(f"[{symbol}] Trade error: {trade_err}")
+                            try:
+                                account_id_holder["id"] = await get_demo_account_id()
+                            except Exception as refresh_err:
+                                print(f"[{symbol}] Account re-discovery failed: "
+                                      f"{refresh_err}")
+                    else:
+                        print(f"[{symbol}] No signal on this closed candle.")
 
         except Exception as e:
             print(f"[{symbol}] Error in strategy loop: {e}")
@@ -344,6 +394,9 @@ async def main():
     account_id_holder = {"id": await get_demo_account_id()}
 
     print(f"Bot started (15m breakout mode). Running on: {', '.join(SYMBOLS)}")
+    if REST_ENABLED:
+        print(f"Rest period: day {REST_START_DAY} {REST_START_HOUR}:00 to "
+              f"day {REST_END_DAY} {REST_END_HOUR}:00 ({REST_TIMEZONE})")
 
     await asyncio.gather(*[
         run_symbol_loop(symbol, account_id_holder) for symbol in SYMBOLS
