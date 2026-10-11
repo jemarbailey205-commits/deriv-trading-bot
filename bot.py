@@ -1,19 +1,37 @@
 """
 Deriv AO + AC Breakout Bot  (API v1)
 -------------------------------------------------------
-Strategy (run independently per symbol):
-- Structure break: the signal candle's close must actually break outside
-  the recent swing high (bullish) or swing low (bearish), measured over
-  the STRUCTURE_LOOKBACK candles BEFORE the signal candle.
-- Momentum confirmation: AO or AC (at least one) must have crossed the zero
-  line in the same direction as the break, either on the signal candle itself
-  or up to ZERO_CROSS_WINDOW candles before it. The indicator that crossed
-  must still be on the correct side of zero on the signal candle.
-- A trade is only placed when both conditions align on the same CLOSED candle.
-- Rest period: no trades are placed between REST_START and REST_END
-  (default: Friday 6 PM to Saturday 6 PM, Jamaica time).
+Strategy (run independently per symbol), 15-minute candles:
 
-Timeframe: 15-minute candles.
+Step 1 - Momentum (either trigger):
+  Trigger 1: AO and AC BOTH cross the zero line in the same direction,
+             within CROSS_GAP candles of each other.
+  Trigger 2: ONE of AO/AC crosses the zero line, and the OTHER shows a
+             "loose saucer" in the same direction (measurable, see below).
+             The other indicator does not need to cross zero.
+
+Step 2 - Structure: the signal candle (latest closed candle) must close
+  beyond the swing high (bullish) or swing low (bearish) of the prior
+  STRUCTURE_LOOKBACK candles.
+
+Step 3 - Trade in the confirmed direction.
+
+Definitions:
+- Candle numbering: the signal candle is age 0, the one before it is age 1.
+  A cross "on candle k" means the oscillator went from the wrong side of
+  zero to the right side on that candle. The first cross counts as candle 0
+  of the CROSS_GAP window, so CROSS_GAP = 2 means the two crosses can be at
+  most 2 candles apart.
+- The latest cross must be at most MOMENTUM_MAX_AGE candles old at the signal
+  candle, and the crossed indicator must still be on the correct side of zero.
+- Saucer (bullish): the last SAUCER_BARS bars of the indicator are each higher
+  than the one before, preceded by a falling bar, and the total rise from the
+  low bar is at least SAUCER_MIN_ATR x ATR. Bearish is the mirror image.
+  Based on bar HEIGHT changes, not platform colors.
+- Duplicate protection: one trade per crossover event, plus a per-symbol
+  cooldown of COOLDOWN_CANDLES candles after a successful trade.
+- Optional filters: breakout buffer (ATR-based) and candle body strength.
+- Rest period: no trades Friday 6 PM to Saturday 6 PM (Jamaica time).
 
 Authentication (Deriv API v1):
 - GET accounts -> find demo account ID
@@ -52,13 +70,29 @@ DURATION      = 5
 DURATION_UNIT = "m"
 
 # --- AO / AC settings ---
-AC_SMA_PERIOD     = 5        # AC = AO - SMA(AO, 5)  (standard Bill Williams)
-ZERO_CROSS_WINDOW = 2        # zero cross may be on the signal candle or up to
-                             # this many candles before it
-MIN_CANDLES       = 50       # AO needs 34, AC needs ~38; extra buffer
+AC_SMA_PERIOD = 5            # AC = AO - SMA(AO, 5)  (standard Bill Williams)
+MIN_CANDLES   = 50           # AO needs 34, AC needs ~38; extra buffer
+ATR_PERIOD    = 14
+
+# --- Momentum triggers ---
+TRIGGER1_ENABLED   = True    # both AO and AC cross zero close together
+TRIGGER2_ENABLED   = True    # one crosses zero + other shows a loose saucer
+CROSS_GAP          = 2       # max candles between the AO and AC crosses
+MOMENTUM_MAX_AGE   = 2       # latest cross must be at most this old
+SAUCER_BARS        = 2       # consecutive rising/falling bars after a reversal bar
+SAUCER_MIN_ATR     = 0.05    # min total move of the saucer, as a fraction of ATR
 
 # --- Structure filter ---
 STRUCTURE_LOOKBACK = 25      # candles to look back for swing high/low
+
+# --- Optional false-breakout filters (turn on one at a time and compare) ---
+BREAKOUT_BUFFER_ENABLED = False
+BREAKOUT_BUFFER_ATR     = 0.25   # close must be beyond the level by this x ATR
+BODY_FILTER_ENABLED     = False
+MIN_BODY_RATIO          = 0.6    # candle body must be >= 60% of its full range
+
+# --- Duplicate protection ---
+COOLDOWN_CANDLES = 3         # per-symbol pause after a successful trade
 
 # --- Rest period filter ---
 # No trades between REST_START and REST_END (local time in REST_TIMEZONE).
@@ -111,7 +145,6 @@ def is_rest_period() -> bool:
 
     if start_min <= end_min:
         return start_min <= now_min < end_min
-    # Window wraps around the end of the week (e.g. Sunday -> Monday)
     return now_min >= start_min or now_min < end_min
 
 
@@ -197,94 +230,161 @@ def build_dataframe(candles: list) -> pd.DataFrame:
     return df
 
 
-# ====== INDICATOR HELPERS ======
+def candle_id(df: pd.DataFrame, idx: int) -> int:
+    """Epoch of the candle at negative index idx (falls back to position)."""
+    if "epoch" in df.columns:
+        return int(df["epoch"].iloc[idx])
+    return len(df) + idx
 
-def crossed_up_within(series: pd.Series, window: int) -> bool:
+
+# ====== MOMENTUM HELPERS ======
+
+def last_cross(series: pd.Series, direction: str, max_back: int):
     """
-    True if the series crossed from <= 0 to > 0 on the signal candle or on
-    any of the `window` candles before it, AND is still above zero on the
-    signal candle.
+    Age (in candles, 0 = signal candle) of the most recent zero-line cross in
+    `direction` ("up" or "down") within the last max_back candles. The series
+    must still be on the correct side of zero on the signal candle.
+    Returns None if there is no such cross.
     """
-    if not series.iloc[-1] > 0:
-        return False
-    for k in range(window + 1):
+    last = series.iloc[-1]
+    if direction == "up" and not last > 0:
+        return None
+    if direction == "down" and not last < 0:
+        return None
+
+    for k in range(max_back + 1):
         idx = -1 - k
-        if series.iloc[idx - 1] <= 0 < series.iloc[idx]:
-            return True
-    return False
+        prev, cur = series.iloc[idx - 1], series.iloc[idx]
+        if direction == "up" and prev <= 0 < cur:
+            return k
+        if direction == "down" and prev >= 0 > cur:
+            return k
+    return None
 
 
-def crossed_down_within(series: pd.Series, window: int) -> bool:
+def has_saucer(series: pd.Series, direction: str, atr: float) -> bool:
     """
-    True if the series crossed from >= 0 to < 0 on the signal candle or on
-    any of the `window` candles before it, AND is still below zero on the
-    signal candle.
+    Loose saucer based on bar height changes:
+      up:   a falling bar, then SAUCER_BARS consecutive rising bars, with the
+            total rise from the low bar >= SAUCER_MIN_ATR x ATR.
+      down: a rising bar, then SAUCER_BARS consecutive falling bars, with the
+            total fall from the high bar >= SAUCER_MIN_ATR x ATR.
+    The indicator may be above or below zero.
     """
-    if not series.iloc[-1] < 0:
-        return False
-    for k in range(window + 1):
-        idx = -1 - k
-        if series.iloc[idx - 1] >= 0 > series.iloc[idx]:
-            return True
-    return False
+    n = SAUCER_BARS
+    diffs = series.diff()
+    recent = diffs.iloc[-n:]
+    before = diffs.iloc[-(n + 1)]
+    min_move = SAUCER_MIN_ATR * atr
+
+    if direction == "up":
+        if not ((recent > 0).all() and before < 0):
+            return False
+        return (series.iloc[-1] - series.iloc[-(n + 1)]) >= min_move
+    else:
+        if not ((recent < 0).all() and before > 0):
+            return False
+        return (series.iloc[-(n + 1)] - series.iloc[-1]) >= min_move
 
 
-def broke_resistance(df: pd.DataFrame) -> bool:
-    """Signal candle closes ABOVE the swing high of the prior lookback window."""
+def detect_momentum(df, ao, ac, direction: str, atr: float):
+    """
+    Returns (trigger_name, cross_candle_epoch) if a momentum setup exists in
+    `direction`, otherwise None. The cross_candle_epoch identifies the
+    crossover event so the same event is never traded twice.
+    """
+    lookback = MOMENTUM_MAX_AGE + CROSS_GAP
+    k_ao = last_cross(ao, direction, lookback)
+    k_ac = last_cross(ac, direction, lookback)
+
+    # Trigger 1: both cross zero within CROSS_GAP candles of each other
+    if (TRIGGER1_ENABLED and k_ao is not None and k_ac is not None
+            and abs(k_ao - k_ac) <= CROSS_GAP
+            and min(k_ao, k_ac) <= MOMENTUM_MAX_AGE):
+        newest = min(k_ao, k_ac)
+        return "T1_both_cross", candle_id(df, -1 - newest)
+
+    # Trigger 2: one crosses zero, the other shows a loose saucer
+    if TRIGGER2_ENABLED:
+        for crossed_k, other in ((k_ao, ac), (k_ac, ao)):
+            if (crossed_k is not None and crossed_k <= MOMENTUM_MAX_AGE
+                    and has_saucer(other, direction, atr)):
+                return "T2_cross_plus_saucer", candle_id(df, -1 - crossed_k)
+
+    return None
+
+
+# ====== STRUCTURE + FILTERS ======
+
+def broke_level(df: pd.DataFrame, direction: str, atr: float) -> bool:
+    """
+    Signal candle closes beyond the swing high (up) or swing low (down) of the
+    prior STRUCTURE_LOOKBACK candles, plus an optional ATR buffer.
+    """
     window = df.iloc[-(STRUCTURE_LOOKBACK + 1):-1]
     if len(window) < STRUCTURE_LOOKBACK:
         return False
-    return df["close"].iloc[-1] > window["high"].max()
+
+    buffer = BREAKOUT_BUFFER_ATR * atr if BREAKOUT_BUFFER_ENABLED else 0.0
+    close = df["close"].iloc[-1]
+
+    if direction == "up":
+        return close > window["high"].max() + buffer
+    return close < window["low"].min() - buffer
 
 
-def broke_support(df: pd.DataFrame) -> bool:
-    """Signal candle closes BELOW the swing low of the prior lookback window."""
-    window = df.iloc[-(STRUCTURE_LOOKBACK + 1):-1]
-    if len(window) < STRUCTURE_LOOKBACK:
+def body_is_strong(df: pd.DataFrame, direction: str) -> bool:
+    """Breakout candle body is a decent share of its range and in direction."""
+    if not BODY_FILTER_ENABLED:
+        return True
+    c = df.iloc[-1]
+    candle_range = c["high"] - c["low"]
+    if candle_range <= 0:
         return False
-    return df["close"].iloc[-1] < window["low"].min()
+    if (abs(c["close"] - c["open"]) / candle_range) < MIN_BODY_RATIO:
+        return False
+    return c["close"] > c["open"] if direction == "up" else c["close"] < c["open"]
 
 
 # ====== SIGNAL DETECTION ======
 
 def check_signal(df: pd.DataFrame):
     """
-    Returns (signal, candle_epoch): signal is "CALL" / "PUT" / None.
-
-    CALL: close breaks above the recent swing high AND AO or AC crossed up
-          through zero on the signal candle or within the previous
-          ZERO_CROSS_WINDOW candles (and is still above zero).
-    PUT:  close breaks below the recent swing low AND AO or AC crossed down
-          through zero on the signal candle or within the previous
-          ZERO_CROSS_WINDOW candles (and is still below zero).
+    Returns (signal, signal_epoch, trigger_name, event_key).
+    signal is "CALL" / "PUT" / None.
+    event_key identifies the crossover event, used for duplicate protection.
     """
-    signal_epoch = df.iloc[-1]["epoch"] if "epoch" in df.columns else None
+    signal_epoch = candle_id(df, -1)
 
     ao = ta.momentum.AwesomeOscillatorIndicator(
         high=df["high"], low=df["low"]
     ).awesome_oscillator()
     ac = ao - ao.rolling(AC_SMA_PERIOD).mean()
-
-    momentum_up = (crossed_up_within(ao, ZERO_CROSS_WINDOW) or
-                   crossed_up_within(ac, ZERO_CROSS_WINDOW))
-    momentum_down = (crossed_down_within(ao, ZERO_CROSS_WINDOW) or
-                     crossed_down_within(ac, ZERO_CROSS_WINDOW))
+    atr = ta.volatility.AverageTrueRange(
+        high=df["high"], low=df["low"], close=df["close"], window=ATR_PERIOD
+    ).average_true_range().iloc[-1]
 
     close_price = df["close"].iloc[-1]
 
-    if momentum_up and broke_resistance(df):
-        return "CALL", signal_epoch
-    if momentum_up:
-        print(f"  Zero-cross up seen but price ({close_price:.4f}) hasn't "
-              f"broken resistance, skipping.")
+    for direction, signal in (("up", "CALL"), ("down", "PUT")):
+        momentum = detect_momentum(df, ao, ac, direction, atr)
+        if momentum is None:
+            continue
 
-    if momentum_down and broke_support(df):
-        return "PUT", signal_epoch
-    if momentum_down:
-        print(f"  Zero-cross down seen but price ({close_price:.4f}) hasn't "
-              f"broken support, skipping.")
+        trigger, cross_epoch = momentum
+        level = "resistance" if direction == "up" else "support"
 
-    return None, signal_epoch
+        if not broke_level(df, direction, atr):
+            print(f"  {trigger} {direction} momentum seen but price "
+                  f"({close_price:.4f}) hasn't broken {level}, skipping.")
+            continue
+        if not body_is_strong(df, direction):
+            print(f"  {trigger} {direction} breakout rejected: weak candle body.")
+            continue
+
+        return signal, signal_epoch, trigger, (direction, cross_epoch)
+
+    return None, signal_epoch, None, None
 
 
 # ====== PLACE TRADE ======
@@ -339,6 +439,7 @@ async def sleep_until_next_candle():
 
 async def run_symbol_loop(symbol: str, account_id_holder: dict):
     last_traded_epoch = None
+    last_event_key = None
 
     while True:
         try:
@@ -352,56 +453,20 @@ async def run_symbol_loop(symbol: str, account_id_holder: dict):
                     print(f"[{symbol}] Not enough closed candles "
                           f"({len(df)} / {MIN_CANDLES} needed).")
                 else:
-                    signal, signal_epoch = check_signal(df)
-                    if signal and signal_epoch == last_traded_epoch:
-                        print(f"[{symbol}] Signal {signal} already traded for "
-                              f"epoch {signal_epoch}, skipping.")
-                    elif signal:
-                        print(f"[{symbol}] Signal detected: {signal} - "
-                              f"placing trade...")
+                    signal, signal_epoch, trigger, event_key = check_signal(df)
+
+                    if not signal:
+                        print(f"[{symbol}] No signal on this closed candle.")
+                    elif event_key == last_event_key:
+                        print(f"[{symbol}] {signal} ({trigger}) is from a "
+                              f"crossover already traded, skipping.")
+                    elif (last_traded_epoch is not None and
+                          signal_epoch - last_traded_epoch
+                          < COOLDOWN_CANDLES * GRANULARITY):
+                        print(f"[{symbol}] {signal} ({trigger}) skipped: "
+                              f"cooldown after last trade.")
+                    else:
+                        print(f"[{symbol}] Signal detected: {signal} via "
+                              f"{trigger} - placing trade...")
                         try:
                             ok = await place_trade(
-                                account_id_holder["id"], symbol, signal
-                            )
-                            if ok:
-                                last_traded_epoch = signal_epoch
-                        except Exception as trade_err:
-                            print(f"[{symbol}] Trade error: {trade_err}")
-                            try:
-                                account_id_holder["id"] = await get_demo_account_id()
-                            except Exception as refresh_err:
-                                print(f"[{symbol}] Account re-discovery failed: "
-                                      f"{refresh_err}")
-                    else:
-                        print(f"[{symbol}] No signal on this closed candle.")
-
-        except Exception as e:
-            print(f"[{symbol}] Error in strategy loop: {e}")
-
-        await sleep_until_next_candle()
-
-
-# ====== MAIN ======
-
-async def main():
-    missing = [v for v in ("DERIV_API_TOKEN", "DERIV_APP_ID") if not os.environ.get(v)]
-    if missing:
-        print(f"ERROR: Missing environment variable(s): {', '.join(missing)}")
-        print("Set them in Railway under your service's Variables tab.")
-        sys.exit(1)
-
-    print("Discovering demo Options account...")
-    account_id_holder = {"id": await get_demo_account_id()}
-
-    print(f"Bot started (15m breakout mode). Running on: {', '.join(SYMBOLS)}")
-    if REST_ENABLED:
-        print(f"Rest period: day {REST_START_DAY} {REST_START_HOUR}:00 to "
-              f"day {REST_END_DAY} {REST_END_HOUR}:00 ({REST_TIMEZONE})")
-
-    await asyncio.gather(*[
-        run_symbol_loop(symbol, account_id_holder) for symbol in SYMBOLS
-    ])
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
