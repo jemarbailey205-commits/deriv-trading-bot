@@ -470,3 +470,48 @@ async def run_symbol_loop(symbol: str, account_id_holder: dict):
                               f"{trigger} - placing trade...")
                         try:
                             ok = await place_trade(
+                                account_id_holder["id"], symbol, signal
+                            )
+                            if ok:
+                                last_traded_epoch = signal_epoch
+                                last_event_key = event_key
+                        except Exception as trade_err:
+                            print(f"[{symbol}] Trade error: {trade_err}")
+                            try:
+                                account_id_holder["id"] = await get_demo_account_id()
+                            except Exception as refresh_err:
+                                print(f"[{symbol}] Account re-discovery failed: "
+                                      f"{refresh_err}")
+
+        except Exception as e:
+            print(f"[{symbol}] Error in strategy loop: {e}")
+
+        await sleep_until_next_candle()
+
+
+# ====== MAIN ======
+
+async def main():
+    missing = [v for v in ("DERIV_API_TOKEN", "DERIV_APP_ID") if not os.environ.get(v)]
+    if missing:
+        print(f"ERROR: Missing environment variable(s): {', '.join(missing)}")
+        print("Set them in Railway under your service's Variables tab.")
+        sys.exit(1)
+
+    print("Discovering demo Options account...")
+    account_id_holder = {"id": await get_demo_account_id()}
+
+    print(f"Bot started (15m breakout mode). Running on: {', '.join(SYMBOLS)}")
+    print(f"Triggers: T1={TRIGGER1_ENABLED} T2={TRIGGER2_ENABLED} | "
+          f"Buffer={BREAKOUT_BUFFER_ENABLED} Body={BODY_FILTER_ENABLED}")
+    if REST_ENABLED:
+        print(f"Rest period: day {REST_START_DAY} {REST_START_HOUR}:00 to "
+              f"day {REST_END_DAY} {REST_END_HOUR}:00 ({REST_TIMEZONE})")
+
+    await asyncio.gather(*[
+        run_symbol_loop(symbol, account_id_holder) for symbol in SYMBOLS
+    ])
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
