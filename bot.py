@@ -107,6 +107,8 @@ REST_END_HOUR   = 18                  # 6 PM
 # --- Timing / robustness ---
 CANDLE_CLOSE_DELAY = 2       # seconds after the boundary before checking
 WS_TIMEOUT         = 15      # seconds to wait for any WebSocket reply
+BUY_RETRIES        = 2       # extra attempts after "Unknown contract proposal"
+BUY_RETRY_DELAY    = 1       # seconds between those attempts
 
 ACCOUNTS_ENDPOINT = "https://api.derivws.com/trading/v1/options/accounts"
 PUBLIC_WS_URL     = "wss://api.derivws.com/trading/v1/options/ws/public"
@@ -389,8 +391,11 @@ def check_signal(df: pd.DataFrame):
 
 # ====== PLACE TRADE ======
 
-async def place_trade(account_id: str, symbol: str, contract_type: str) -> bool:
-    """Returns True only if the buy succeeded."""
+async def _attempt_trade(account_id: str, symbol: str, contract_type: str) -> str:
+    """
+    One full attempt: fresh OTP, proposal, buy.
+    Returns "ok", "retry" (Deriv said the proposal was unknown) or "fail".
+    """
     otp_url = await get_fresh_otp_url(account_id)
 
     proposal_request = {
@@ -410,8 +415,10 @@ async def place_trade(account_id: str, symbol: str, contract_type: str) -> bool:
             msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=WS_TIMEOUT))
             if msg.get("msg_type") == "proposal":
                 if "error" in msg:
-                    print(f"[{symbol}] Proposal error:", msg["error"]["message"])
-                    return False
+                    err = msg["error"]
+                    print(f"[{symbol}] Proposal error: {err.get('message')} "
+                          f"| code={err.get('code')} | details={err.get('details')}")
+                    return "fail"
                 proposal_id = msg["proposal"]["id"]
                 ask_price   = msg["proposal"]["ask_price"]
                 print(f"[{symbol}] Proposal received - ID: {proposal_id}, "
@@ -423,10 +430,36 @@ async def place_trade(account_id: str, symbol: str, contract_type: str) -> bool:
             await asyncio.wait_for(ws.recv(), timeout=WS_TIMEOUT)
         )
         if "error" in buy_response:
-            print(f"[{symbol}] Buy error:", buy_response["error"]["message"])
-            return False
+            err = buy_response["error"]
+            err_msg = err.get("message", "")
+            print(f"[{symbol}] Buy error: {err_msg} | code={err.get('code')} "
+                  f"| details={err.get('details')} | proposal_id={proposal_id} "
+                  f"| ask={ask_price}")
+            if "unknown contract proposal" in err_msg.lower():
+                return "retry"
+            return "fail"
         print(f"[{symbol}] Trade placed successfully:", buy_response)
-        return True
+        return "ok"
+
+
+async def place_trade(account_id: str, symbol: str, contract_type: str) -> bool:
+    """
+    Returns True only if the buy succeeded. If Deriv rejects the buy with
+    "Unknown contract proposal", retry with a brand-new proposal (up to
+    BUY_RETRIES extra attempts). Only that specific error is retried, so a
+    trade is never sent twice after a real buy.
+    """
+    for attempt in range(BUY_RETRIES + 1):
+        result = await _attempt_trade(account_id, symbol, contract_type)
+        if result == "ok":
+            return True
+        if result == "fail":
+            return False
+        if attempt < BUY_RETRIES:
+            print(f"[{symbol}] Retrying with a fresh proposal "
+                  f"({attempt + 1}/{BUY_RETRIES})...")
+            await asyncio.sleep(BUY_RETRY_DELAY)
+    return False
 
 
 # ====== PER-SYMBOL LOOP ======
