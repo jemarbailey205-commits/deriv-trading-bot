@@ -77,13 +77,16 @@ ATR_PERIOD    = 14
 # --- Momentum triggers ---
 TRIGGER1_ENABLED   = True    # both AO and AC cross zero close together
 TRIGGER2_ENABLED   = True    # one crosses zero + other shows a loose saucer
-CROSS_GAP          = 2       # max candles between the AO and AC crosses
-MOMENTUM_MAX_AGE   = 2       # latest cross must be at most this old
+CROSS_GAP          = 3       # max candles between the AO and AC crosses
+MOMENTUM_MAX_AGE   = 3       # latest cross must be at most this old
 SAUCER_BARS        = 2       # consecutive rising/falling bars after a reversal bar
 SAUCER_MIN_ATR     = 0.05    # min total move of the saucer, as a fraction of ATR
 
 # --- Structure filter ---
 STRUCTURE_LOOKBACK = 25      # candles to look back for swing high/low
+BREAKOUT_WINDOW    = 1       # breakout may be on the signal candle or up to this
+                             # many candles before it (price must still be
+                             # beyond the broken level on the signal candle)
 
 # --- Optional false-breakout filters (turn on one at a time and compare) ---
 BREAKOUT_BUFFER_ENABLED = False
@@ -92,7 +95,7 @@ BODY_FILTER_ENABLED     = False
 MIN_BODY_RATIO          = 0.6    # candle body must be >= 60% of its full range
 
 # --- Duplicate protection ---
-COOLDOWN_CANDLES = 3         # per-symbol pause after a successful trade
+COOLDOWN_CANDLES = 4         # per-symbol pause after a trade (> MOMENTUM_MAX_AGE)
 
 # --- Rest period filter ---
 # No trades between REST_START and REST_END (local time in REST_TIMEZONE).
@@ -109,6 +112,8 @@ CANDLE_CLOSE_DELAY = 2       # seconds after the boundary before checking
 WS_TIMEOUT         = 15      # seconds to wait for any WebSocket reply
 BUY_RETRIES        = 2       # extra attempts after "Unknown contract proposal"
 BUY_RETRY_DELAY    = 1       # seconds between those attempts
+
+_trade_lock = None           # created on first use, inside the running event loop
 
 ACCOUNTS_ENDPOINT = "https://api.derivws.com/trading/v1/options/accounts"
 PUBLIC_WS_URL     = "wss://api.derivws.com/trading/v1/options/ws/public"
@@ -219,9 +224,16 @@ async def get_closed_candles(symbol: str) -> list:
                 )
             if response.get("msg_type") == "candles":
                 candles = response["candles"]
-                closed = candles[:-1]   # drop the still-forming candle
-                print(f"[{symbol}] Fetched {len(candles)} candles, "
-                      f"using {len(closed)} closed.")
+                last = candles[-1]
+                # Candle epoch is its open time, so it is still forming if
+                # open time + granularity is in the future. If the new candle
+                # has not started yet, the last one is already closed - keep it.
+                forming = ("epoch" not in last or
+                           last["epoch"] + GRANULARITY > time.time())
+                closed = candles[:-1] if forming else candles
+                print(f"[{symbol}] Fetched {len(candles)} candles, using "
+                      f"{len(closed)} closed"
+                      f"{'' if forming else ' (latest already closed)'}.")
                 return closed
 
 
@@ -318,28 +330,40 @@ def detect_momentum(df, ao, ac, direction: str, atr: float):
 
 # ====== STRUCTURE + FILTERS ======
 
-def broke_level(df: pd.DataFrame, direction: str, atr: float) -> bool:
+def broke_level(df: pd.DataFrame, direction: str, atr: float):
     """
-    Signal candle closes beyond the swing high (up) or swing low (down) of the
-    prior STRUCTURE_LOOKBACK candles, plus an optional ATR buffer.
+    Looks for a close beyond the swing high (up) or swing low (down) of the
+    STRUCTURE_LOOKBACK candles before it, plus an optional ATR buffer. The
+    breakout candle may be the signal candle (offset 0) or up to
+    BREAKOUT_WINDOW candles earlier, but the signal candle's close must still
+    be beyond the broken level (price hasn't fallen back inside).
+    Returns the offset of the breakout candle, or None.
     """
-    window = df.iloc[-(STRUCTURE_LOOKBACK + 1):-1]
-    if len(window) < STRUCTURE_LOOKBACK:
-        return False
-
     buffer = BREAKOUT_BUFFER_ATR * atr if BREAKOUT_BUFFER_ENABLED else 0.0
-    close = df["close"].iloc[-1]
+    close_now = df["close"].iloc[-1]
 
-    if direction == "up":
-        return close > window["high"].max() + buffer
-    return close < window["low"].min() - buffer
+    for j in range(BREAKOUT_WINDOW + 1):
+        window = df.iloc[-(STRUCTURE_LOOKBACK + 1 + j):-(1 + j)]
+        if len(window) < STRUCTURE_LOOKBACK:
+            continue
+        close_j = df["close"].iloc[-1 - j]
+
+        if direction == "up":
+            level = window["high"].max()
+            if close_j > level + buffer and close_now > level + buffer:
+                return j
+        else:
+            level = window["low"].min()
+            if close_j < level - buffer and close_now < level - buffer:
+                return j
+    return None
 
 
-def body_is_strong(df: pd.DataFrame, direction: str) -> bool:
+def body_is_strong(df: pd.DataFrame, direction: str, offset: int = 0) -> bool:
     """Breakout candle body is a decent share of its range and in direction."""
     if not BODY_FILTER_ENABLED:
         return True
-    c = df.iloc[-1]
+    c = df.iloc[-1 - offset]
     candle_range = c["high"] - c["low"]
     if candle_range <= 0:
         return False
@@ -376,11 +400,15 @@ def check_signal(df: pd.DataFrame):
         trigger, cross_epoch = momentum
         level = "resistance" if direction == "up" else "support"
 
-        if not broke_level(df, direction, atr):
+        offset = broke_level(df, direction, atr)
+        if offset is None:
             print(f"  {trigger} {direction} momentum seen but price "
                   f"({close_price:.4f}) hasn't broken {level}, skipping.")
             continue
-        if not body_is_strong(df, direction):
+        if offset > 0:
+            print(f"  {trigger} {direction}: breakout was {offset} candle(s) "
+                  f"ago and price is still beyond {level}.")
+        if not body_is_strong(df, direction, offset):
             print(f"  {trigger} {direction} breakout rejected: weak candle body.")
             continue
 
@@ -413,29 +441,42 @@ async def _attempt_trade(account_id: str, symbol: str, contract_type: str) -> st
         await ws.send(json.dumps(proposal_request))
         while True:
             msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=WS_TIMEOUT))
+            if "error" in msg:
+                err = msg["error"]
+                print(f"[{symbol}] Proposal error: {err.get('message')} "
+                      f"| code={err.get('code')} | details={err.get('details')}")
+                return "fail"
             if msg.get("msg_type") == "proposal":
-                if "error" in msg:
-                    err = msg["error"]
-                    print(f"[{symbol}] Proposal error: {err.get('message')} "
-                          f"| code={err.get('code')} | details={err.get('details')}")
+                proposal = msg.get("proposal", {})
+                proposal_id = proposal.get("id")
+                ask_price   = proposal.get("ask_price")
+                if not proposal_id or ask_price is None:
+                    print(f"[{symbol}] Proposal response missing ID or price.")
                     return "fail"
-                proposal_id = msg["proposal"]["id"]
-                ask_price   = msg["proposal"]["ask_price"]
                 print(f"[{symbol}] Proposal received - ID: {proposal_id}, "
                       f"Ask: {ask_price}")
                 break
 
         await ws.send(json.dumps({"buy": proposal_id, "price": ask_price}))
-        buy_response = json.loads(
-            await asyncio.wait_for(ws.recv(), timeout=WS_TIMEOUT)
-        )
+        try:
+            while True:
+                buy_response = json.loads(
+                    await asyncio.wait_for(ws.recv(), timeout=WS_TIMEOUT)
+                )
+                if buy_response.get("msg_type") == "buy" or "error" in buy_response:
+                    break
+        except asyncio.TimeoutError:
+            print(f"[{symbol}] No reply to the buy request - outcome UNKNOWN. "
+                  f"Check your Deriv account before assuming it failed.")
+            return "unknown"
         if "error" in buy_response:
             err = buy_response["error"]
             err_msg = err.get("message", "")
             print(f"[{symbol}] Buy error: {err_msg} | code={err.get('code')} "
                   f"| details={err.get('details')} | proposal_id={proposal_id} "
                   f"| ask={ask_price}")
-            if "unknown contract proposal" in err_msg.lower():
+            if ("unknown contract proposal" in err_msg.lower()
+                    or err.get("code") == "InvalidContractProposal"):
                 return "retry"
             return "fail"
         print(f"[{symbol}] Trade placed successfully:", buy_response)
@@ -449,17 +490,32 @@ async def place_trade(account_id: str, symbol: str, contract_type: str) -> bool:
     BUY_RETRIES extra attempts). Only that specific error is retried, so a
     trade is never sent twice after a real buy.
     """
-    for attempt in range(BUY_RETRIES + 1):
-        result = await _attempt_trade(account_id, symbol, contract_type)
-        if result == "ok":
-            return True
-        if result == "fail":
-            return False
-        if attempt < BUY_RETRIES:
-            print(f"[{symbol}] Retrying with a fresh proposal "
-                  f"({attempt + 1}/{BUY_RETRIES})...")
-            await asyncio.sleep(BUY_RETRY_DELAY)
-    return False
+    global _trade_lock
+    if _trade_lock is None:
+        _trade_lock = asyncio.Lock()
+
+    # Only one symbol trades at a time, so simultaneous signals on a candle
+    # boundary never overlap their proposal/buy requests.
+    t_wait = time.time()
+    async with _trade_lock:
+        waited = time.time() - t_wait
+        if waited > 1:
+            print(f"[{symbol}] Waited {waited:.1f}s for the trade lock.")
+        for attempt in range(BUY_RETRIES + 1):
+            result = await _attempt_trade(account_id, symbol, contract_type)
+            if result == "ok":
+                return True
+            if result == "unknown":
+                # The buy may have gone through. Treat the event as consumed
+                # so the same signal is never sent a second time.
+                return True
+            if result == "fail":
+                return False
+            if attempt < BUY_RETRIES:
+                print(f"[{symbol}] Retrying with a fresh proposal "
+                      f"({attempt + 1}/{BUY_RETRIES})...")
+                await asyncio.sleep(BUY_RETRY_DELAY)
+        return False
 
 
 # ====== PER-SYMBOL LOOP ======
