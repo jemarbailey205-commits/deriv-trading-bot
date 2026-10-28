@@ -39,7 +39,10 @@ Definitions:
   Results are read back from Deriv after each contract expires.
 - Trade log: every settled trade is appended to a CSV. Run
   `python bot-4.py report` for win rate by symbol, trigger, ADX band and hour.
-- Fixed stake: STAKE never changes after wins or losses.
+- Stake ladder (per symbol): each symbol steps through fixed percentages of
+  BANKROLL - down after a loss, up after a win - between a floor and a cap.
+  The stake is never doubled to win losses back. A total-at-risk limit caps
+  the combined stake of all open trades across the three symbols.
 
 Authentication (Deriv API v1):
 - GET accounts -> find demo account ID
@@ -74,7 +77,7 @@ APP_ID        = os.environ.get("DERIV_APP_ID")
 SYMBOLS       = ["R_25", "R_75", "R_100"]
 GRANULARITY   = 900          # 15-minute candles
 CANDLE_COUNT  = 110
-STAKE         = 10           # FIXED. Never raised after a loss (no martingale).
+BANKROLL      = 10           # the amount the percentages below apply to
 DURATION      = 5
 DURATION_UNIT = "m"
 
@@ -114,11 +117,20 @@ ATR_RATIO_ENABLED  = True
 ATR_AVG_PERIOD     = 30      # compare ATR to its own average over this many candles
 ATR_RATIO_MIN      = 0.9     # skip if ATR is below this x its recent average
 
+# --- Stake ladder (each symbol has its own position on the ladder) ---
+# Percent of BANKROLL. A win moves one step right, a loss one step left.
+# First rung 20% and last rung 80% are the floor and the hard cap.
+STAKE_LADDER_PCT   = [20, 30, 40, 60, 80]
+STAKE_START_PCT    = 40          # every symbol starts here, and resets here
+RESET_LADDER_AFTER_PAUSE = True  # back to the start rung after a breaker pause
+MAX_TOTAL_RISK_PCT = 60          # combined stake of all open trades, % of BANKROLL
+MIN_STAKE          = 1.0         # Deriv's minimum stake - never go below this
+
 # --- Loss circuit breaker ---
 BREAKER_ENABLED         = True
 MAX_CONSEC_LOSSES       = 3      # pause after this many losses in a row (0 = off)
 CONSEC_LOSS_PAUSE_HOURS = 3      # length of that pause
-MAX_DAILY_LOSS          = 50     # pause until the next local day when the day's net
+MAX_DAILY_LOSS          = 8      # pause until the next local day when the day's net
                                  # loss reaches this amount (0 = off). Open trades
                                  # count as possible losses, so the cap holds.
 
@@ -496,7 +508,8 @@ def check_signal(df: pd.DataFrame):
 
 # ====== PLACE TRADE ======
 
-async def _attempt_trade(account_id: str, symbol: str, contract_type: str):
+async def _attempt_trade(account_id: str, symbol: str, contract_type: str,
+                         stake: float):
     """
     One full attempt: fresh OTP, proposal, buy.
     Returns (status, info). status is "ok", "unknown" (the buy may or may not
@@ -507,7 +520,7 @@ async def _attempt_trade(account_id: str, symbol: str, contract_type: str):
 
     proposal_request = {
         "proposal": 1,
-        "amount": STAKE,
+        "amount": stake,
         "basis": "stake",
         "contract_type": contract_type,
         "currency": "USD",
@@ -572,7 +585,8 @@ async def _attempt_trade(account_id: str, symbol: str, contract_type: str):
         return "ok", info
 
 
-async def place_trade(account_id: str, symbol: str, contract_type: str):
+async def place_trade(account_id: str, symbol: str, contract_type: str,
+                      stake: float):
     """
     Returns (placed, info). placed is True if the buy succeeded or its outcome
     is unknown (so the signal is treated as used). If Deriv rejects the buy
@@ -592,7 +606,7 @@ async def place_trade(account_id: str, symbol: str, contract_type: str):
         if waited > 1:
             print(f"[{symbol}] Waited {waited:.1f}s for the trade lock.")
         for attempt in range(BUY_RETRIES + 1):
-            status, info = await _attempt_trade(account_id, symbol, contract_type)
+            status, info = await _attempt_trade(account_id, symbol, contract_type, stake)
             if status in ("ok", "unknown"):
                 return True, info
             if status == "fail":
@@ -602,6 +616,19 @@ async def place_trade(account_id: str, symbol: str, contract_type: str):
                       f"({attempt + 1}/{BUY_RETRIES})...")
                 await asyncio.sleep(BUY_RETRY_DELAY)
         return False, {}
+
+
+# ====== STAKE LADDER ======
+
+def stake_for_pct(pct: float) -> float:
+    return round(max(MIN_STAKE, BANKROLL * pct / 100.0), 2)
+
+
+def start_rung() -> int:
+    if STAKE_START_PCT in STAKE_LADDER_PCT:
+        return STAKE_LADDER_PCT.index(STAKE_START_PCT)
+    return min(range(len(STAKE_LADDER_PCT)),
+               key=lambda i: abs(STAKE_LADDER_PCT[i] - STAKE_START_PCT))
 
 
 # ====== RISK MANAGER (LOSS CIRCUIT BREAKER) ======
@@ -627,6 +654,7 @@ class RiskManager:
         self.pause_until = 0.0
         self.pause_reason = ""
         self.open_stakes = 0.0          # stake currently riding on unsettled trades
+        self.rungs = {}                 # {symbol: position on the stake ladder}
         self.symbol_stats = {}          # since this start: {symbol: {w, l, pnl}}
         self._load()
         self._roll_day()
@@ -640,6 +668,9 @@ class RiskManager:
             self.streak = int(s.get("streak", 0))
             self.pause_until = float(s.get("pause_until", 0.0))
             self.pause_reason = s.get("pause_reason", "")
+            saved = s.get("rungs", {})
+            top = len(STAKE_LADDER_PCT) - 1
+            self.rungs = {k: max(0, min(int(v), top)) for k, v in saved.items()}
         except FileNotFoundError:
             pass
         except Exception as e:
@@ -652,6 +683,7 @@ class RiskManager:
                     "day": self.day, "daily_pnl": self.daily_pnl,
                     "streak": self.streak, "pause_until": self.pause_until,
                     "pause_reason": self.pause_reason,
+                    "rungs": self.rungs,
                 }, f)
         except Exception as e:
             print(f"Could not save {STATE_FILE}: {e}")
@@ -670,11 +702,21 @@ class RiskManager:
             return
         self.pause_until = until_ts
         self.pause_reason = reason
+        if RESET_LADDER_AFTER_PAUSE:
+            self.rungs = {}
+            print("Stake ladder reset to the starting rung for every symbol.")
         resume = _local_now() + timedelta(seconds=until_ts - time.time())
         print(f"*** CIRCUIT BREAKER: {reason}. Trading paused until "
               f"{resume.strftime('%a %H:%M')} ({REST_TIMEZONE}). ***")
 
-    def can_trade(self, new_trade: bool = False):
+    def current_stake(self, symbol: str) -> float:
+        rung = self.rungs.get(symbol, start_rung())
+        return stake_for_pct(STAKE_LADDER_PCT[rung])
+
+    def risk_limit(self) -> float:
+        return BANKROLL * MAX_TOTAL_RISK_PCT / 100.0
+
+    def can_trade(self, new_trade: bool = False, symbol: str = None):
         """Returns (allowed, reason). new_trade=True also applies the hard cap."""
         if not BREAKER_ENABLED:
             return True, ""
@@ -683,12 +725,19 @@ class RiskManager:
         if now < self.pause_until:
             mins = (self.pause_until - now) / 60
             return False, f"{self.pause_reason}; resumes in {mins:.0f} min"
-        if (new_trade and MAX_DAILY_LOSS > 0
-                and self.daily_pnl - self.open_stakes - STAKE < -MAX_DAILY_LOSS):
-            return False, (f"open trades could push today past the "
-                           f"{MAX_DAILY_LOSS} loss cap "
-                           f"(day P&L {self.daily_pnl:+.2f}, "
-                           f"{self.open_stakes:.0f} at risk)")
+        if new_trade and symbol is not None:
+            stake = self.current_stake(symbol)
+            if MAX_TOTAL_RISK_PCT > 0 and self.open_stakes + stake > self.risk_limit() + 1e-9:
+                return False, (f"total at-risk limit: {self.open_stakes:.2f} already "
+                               f"open + {stake:.2f} would pass the "
+                               f"{self.risk_limit():.2f} limit "
+                               f"({MAX_TOTAL_RISK_PCT}% of {BANKROLL})")
+            if (MAX_DAILY_LOSS > 0
+                    and self.daily_pnl - self.open_stakes - stake < -MAX_DAILY_LOSS):
+                return False, (f"open trades could push today past the "
+                               f"{MAX_DAILY_LOSS} loss cap "
+                               f"(day P&L {self.daily_pnl:+.2f}, "
+                               f"{self.open_stakes:.2f} at risk)")
         return True, ""
 
     def record_result(self, symbol: str, profit: float):
@@ -698,6 +747,14 @@ class RiskManager:
             self.streak += 1
         elif profit > 0:
             self.streak = 0
+
+        top = len(STAKE_LADDER_PCT) - 1
+        rung = self.rungs.get(symbol, start_rung())
+        if profit > 0:
+            rung = min(top, rung + 1)
+        elif profit < 0:
+            rung = max(0, rung - 1)
+        self.rungs[symbol] = rung
 
         st = self.symbol_stats.setdefault(symbol, {"w": 0, "l": 0, "pnl": 0.0})
         st["pnl"] += profit
@@ -720,8 +777,9 @@ class RiskManager:
         paused = ""
         if time.time() < self.pause_until:
             paused = f" | PAUSED: {self.pause_reason}"
-        return (f"day P&L {self.daily_pnl:+.2f} | loss streak {self.streak}"
-                f"{paused}")
+        nxt = ", ".join(f"{sym} {self.current_stake(sym):.2f}" for sym in SYMBOLS)
+        return (f"day P&L {self.daily_pnl:+.2f} | loss streak {self.streak} | "
+                f"next stakes: {nxt}{paused}")
 
 
 # ====== RESULT TRACKING + TRADE LOG ======
@@ -798,7 +856,7 @@ async def settle_and_record(account_id: str, ctx: dict, trade_info: dict,
     except Exception as e:
         print(f"[{symbol}] Result tracking error: {e}")
     finally:
-        risk.open_stakes = max(0.0, risk.open_stakes - STAKE)
+        risk.open_stakes = max(0.0, risk.open_stakes - ctx["stake"])
 
     if profit is None:
         result = "UNKNOWN"
@@ -822,7 +880,7 @@ async def settle_and_record(account_id: str, ctx: dict, trade_info: dict,
         "symbol": symbol,
         "direction": ctx["direction"],
         "trigger": ctx["trigger"],
-        "stake": STAKE,
+        "stake": ctx["stake"],
         "entry_ask": trade_info.get("ask_price", ""),
         "contract_id": contract_id or "",
         "adx": fmt(ctx.get("adx"), 1),
@@ -940,16 +998,18 @@ async def run_symbol_loop(symbol: str, account_id_holder: dict, risk: RiskManage
                             print(f"[{symbol}] {signal} ({trigger}) skipped: "
                                   f"cooldown after last trade.")
                         else:
-                            allowed, why = risk.can_trade(new_trade=True)
+                            allowed, why = risk.can_trade(new_trade=True, symbol=symbol)
                             if not allowed:
                                 print(f"[{symbol}] {signal} ({trigger}) skipped: "
                                       f"{why}.")
                             else:
+                                stake = risk.current_stake(symbol)
                                 print(f"[{symbol}] Signal detected: {signal} via "
-                                      f"{trigger} - placing trade...")
+                                      f"{trigger} - placing trade, stake {stake:.2f}...")
                                 now_local = _local_now()
                                 ctx = {
                                     "symbol": symbol,
+                                    "stake": stake,
                                     "direction": signal,
                                     "trigger": trigger,
                                     "adx": info.get("adx"),
@@ -960,12 +1020,13 @@ async def run_symbol_loop(symbol: str, account_id_holder: dict, risk: RiskManage
                                 }
                                 try:
                                     ok, trade_info = await place_trade(
-                                        account_id_holder["id"], symbol, signal
+                                        account_id_holder["id"], symbol, signal,
+                                        stake,
                                     )
                                     if ok:
                                         last_traded_epoch = signal_epoch
                                         last_event_key = event_key
-                                        risk.open_stakes += STAKE
+                                        risk.open_stakes += stake
                                         task = asyncio.create_task(
                                             settle_and_record(
                                                 account_id_holder["id"], ctx,
@@ -1017,7 +1078,9 @@ async def main():
           f"Buffer={BREAKOUT_BUFFER_ENABLED} Body={BODY_FILTER_ENABLED}")
     print(f"Choppy filter: ADX>={ADX_MIN} ({ADX_FILTER_ENABLED}), "
           f"ATR ratio>={ATR_RATIO_MIN} ({ATR_RATIO_ENABLED}) | "
-          f"Fixed stake: {STAKE}")
+          f"Stake ladder (% of {BANKROLL}): {STAKE_LADDER_PCT}, start "
+          f"{STAKE_START_PCT}%, per symbol | total at-risk limit "
+          f"{MAX_TOTAL_RISK_PCT}%")
     if BREAKER_ENABLED:
         print(f"Circuit breaker: {MAX_CONSEC_LOSSES} losses in a row -> "
               f"{CONSEC_LOSS_PAUSE_HOURS}h pause | daily loss cap "
