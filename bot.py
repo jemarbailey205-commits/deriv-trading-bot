@@ -88,7 +88,7 @@ ATR_PERIOD    = 14
 
 # --- Momentum triggers ---
 TRIGGER1_ENABLED   = True    # both AO and AC cross zero close together
-TRIGGER2_ENABLED   = True    # one crosses zero + other shows a loose saucer
+TRIGGER2_ENABLED   = False    # one crosses zero + other shows a loose saucer
 CROSS_GAP          = 3       # max candles between the AO and AC crosses
 MOMENTUM_MAX_AGE   = 3       # latest cross must be at most this old
 SAUCER_BARS        = 2       # consecutive rising/falling bars after a reversal bar
