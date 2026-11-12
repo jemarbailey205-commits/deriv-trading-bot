@@ -1,7 +1,7 @@
 """
 Deriv AO + AC Breakout Bot  (API v1)
 -------------------------------------------------------
-Strategy (run independently per symbol), 15-minute candles:
+Strategy (run independently per symbol), 5-minute candles, 1-minute trades:
 
 Step 1 - Momentum (either trigger):
   Trigger 1: AO and AC BOTH cross the zero line in the same direction,
@@ -35,7 +35,7 @@ Definitions:
 - Choppy-market filter: skips breakouts when ADX is low or ATR is well below
   its recent average (sideways / quiet markets).
 - Loss circuit breaker: pauses all trading after N losses in a row (for a few
-  hours) or when the day's net loss reaches a cap (until the next local day).
+  hours) or when the day's net loss reaches a cap (for 12 hours).
   Results are read back from Deriv after each contract expires.
 - Trade log: every settled trade is appended to a CSV. Run
   `python bot-4.py report` for win rate by symbol, trigger, ADX band and hour.
@@ -75,10 +75,10 @@ API_TOKEN     = os.environ.get("DERIV_API_TOKEN")
 APP_ID        = os.environ.get("DERIV_APP_ID")
 
 SYMBOLS       = ["R_25", "R_75", "R_100"]
-GRANULARITY   = 900          # 15-minute candles
+GRANULARITY   = 300          # 5-minute candles
 CANDLE_COUNT  = 110
 BANKROLL      = 10           # the amount the percentages below apply to
-DURATION      = 5
+DURATION      = 1
 DURATION_UNIT = "m"
 
 # --- AO / AC settings ---
@@ -130,9 +130,11 @@ MIN_STAKE          = 1.0         # Deriv's minimum stake - never go below this
 BREAKER_ENABLED         = True
 MAX_CONSEC_LOSSES       = 3      # pause after this many losses in a row (0 = off)
 CONSEC_LOSS_PAUSE_HOURS = 3      # length of that pause
-MAX_DAILY_LOSS          = 8      # pause until the next local day when the day's net
-                                 # loss reaches this amount (0 = off). Open trades
-                                 # count as possible losses, so the cap holds.
+MAX_DAILY_LOSS          = 8      # pause when the day's net loss reaches this amount
+                                 # (0 = off). Open trades count as possible losses,
+                                 # so the cap holds.
+MAX_DAILY_LOSS_PAUSE_HOURS = 12  # how long that pause lasts. When it ends, the
+                                 # day's P&L resets to 0 so trading really resumes.
 
 # --- Per-symbol control, trade log, saved state ---
 DISABLED_SYMBOLS = []            # e.g. ["R_100"] to switch a symbol off
@@ -653,6 +655,7 @@ class RiskManager:
         self.streak = 0
         self.pause_until = 0.0
         self.pause_reason = ""
+        self.pause_clears_daily = False  # daily-cap pause: reset day P&L on resume
         self.open_stakes = 0.0          # stake currently riding on unsettled trades
         self.rungs = {}                 # {symbol: position on the stake ladder}
         self.symbol_stats = {}          # since this start: {symbol: {w, l, pnl}}
@@ -668,6 +671,7 @@ class RiskManager:
             self.streak = int(s.get("streak", 0))
             self.pause_until = float(s.get("pause_until", 0.0))
             self.pause_reason = s.get("pause_reason", "")
+            self.pause_clears_daily = bool(s.get("pause_clears_daily", False))
             saved = s.get("rungs", {})
             top = len(STAKE_LADDER_PCT) - 1
             self.rungs = {k: max(0, min(int(v), top)) for k, v in saved.items()}
@@ -683,6 +687,7 @@ class RiskManager:
                     "day": self.day, "daily_pnl": self.daily_pnl,
                     "streak": self.streak, "pause_until": self.pause_until,
                     "pause_reason": self.pause_reason,
+                    "pause_clears_daily": self.pause_clears_daily,
                     "rungs": self.rungs,
                 }, f)
         except Exception as e:
@@ -697,11 +702,12 @@ class RiskManager:
             self.streak = 0
             self._save()
 
-    def _pause(self, until_ts: float, reason: str):
+    def _pause(self, until_ts: float, reason: str, clear_daily: bool = False):
         if until_ts <= self.pause_until:
             return
         self.pause_until = until_ts
         self.pause_reason = reason
+        self.pause_clears_daily = clear_daily
         if RESET_LADDER_AFTER_PAUSE:
             self.rungs = {}
             print("Stake ladder reset to the starting rung for every symbol.")
@@ -709,8 +715,18 @@ class RiskManager:
         print(f"*** CIRCUIT BREAKER: {reason}. Trading paused until "
               f"{resume.strftime('%a %H:%M')} ({REST_TIMEZONE}). ***")
 
+    def max_rung(self) -> int:
+        """Highest rung whose stake fits under the total at-risk limit, so a
+        symbol can never climb to a stake that could never be placed."""
+        top = len(STAKE_LADDER_PCT) - 1
+        if MAX_TOTAL_RISK_PCT <= 0:
+            return top
+        ok = [i for i, p in enumerate(STAKE_LADDER_PCT)
+              if stake_for_pct(p) <= self.risk_limit() + 1e-9]
+        return max(ok) if ok else 0
+
     def current_stake(self, symbol: str) -> float:
-        rung = self.rungs.get(symbol, start_rung())
+        rung = min(self.rungs.get(symbol, start_rung()), self.max_rung())
         return stake_for_pct(STAKE_LADDER_PCT[rung])
 
     def risk_limit(self) -> float:
@@ -725,6 +741,13 @@ class RiskManager:
         if now < self.pause_until:
             mins = (self.pause_until - now) / 60
             return False, f"{self.pause_reason}; resumes in {mins:.0f} min"
+        if self.pause_clears_daily:
+            print("Daily-loss pause is over: day P&L and loss streak reset, "
+                  "trading resumes.")
+            self.pause_clears_daily = False
+            self.daily_pnl = 0.0
+            self.streak = 0
+            self._save()
         if new_trade and symbol is not None:
             stake = self.current_stake(symbol)
             if MAX_TOTAL_RISK_PCT > 0 and self.open_stakes + stake > self.risk_limit() + 1e-9:
@@ -748,8 +771,8 @@ class RiskManager:
         elif profit > 0:
             self.streak = 0
 
-        top = len(STAKE_LADDER_PCT) - 1
-        rung = self.rungs.get(symbol, start_rung())
+        top = self.max_rung()
+        rung = min(self.rungs.get(symbol, start_rung()), top)
         if profit > 0:
             rung = min(top, rung + 1)
         elif profit < 0:
@@ -764,9 +787,11 @@ class RiskManager:
             st["l"] += 1
 
         if BREAKER_ENABLED:
-            if MAX_DAILY_LOSS > 0 and self.daily_pnl <= -MAX_DAILY_LOSS:
-                self._pause(_next_local_midnight_ts(),
-                            f"daily loss cap reached ({self.daily_pnl:+.2f})")
+            if (MAX_DAILY_LOSS > 0 and self.daily_pnl <= -MAX_DAILY_LOSS
+                    and time.time() >= self.pause_until):
+                self._pause(time.time() + MAX_DAILY_LOSS_PAUSE_HOURS * 3600,
+                            f"daily loss cap reached ({self.daily_pnl:+.2f})",
+                            clear_daily=True)
             elif MAX_CONSEC_LOSSES > 0 and self.streak >= MAX_CONSEC_LOSSES:
                 self._pause(time.time() + CONSEC_LOSS_PAUSE_HOURS * 3600,
                             f"{self.streak} losses in a row")
@@ -852,7 +877,9 @@ async def settle_and_record(account_id: str, ctx: dict, trade_info: dict,
             profit = await fetch_result(account_id, symbol, contract_id)
         else:
             print(f"[{symbol}] No contract ID in the buy reply, so this "
-                  f"trade's result can't be tracked.")
+                  f"trade's result can't be tracked. Keeping its stake "
+                  f"counted as at-risk until it would have expired.")
+            await asyncio.sleep(DURATION_SECONDS + SETTLE_BUFFER)
     except Exception as e:
         print(f"[{symbol}] Result tracking error: {e}")
     finally:
@@ -1018,15 +1045,23 @@ async def run_symbol_loop(symbol: str, account_id_holder: dict, risk: RiskManage
                                         "%Y-%m-%d %H:%M:%S"),
                                     "local_hour": now_local.hour,
                                 }
+                                # Reserve the stake now (no await since the
+                                # can_trade check) so simultaneous signals on
+                                # other symbols see it and respect the caps.
+                                risk.open_stakes += stake
+                                reserved = True
                                 try:
                                     ok, trade_info = await place_trade(
                                         account_id_holder["id"], symbol, signal,
                                         stake,
                                     )
+                                    if not ok:
+                                        risk.open_stakes = max(
+                                            0.0, risk.open_stakes - stake)
+                                        reserved = False
                                     if ok:
                                         last_traded_epoch = signal_epoch
                                         last_event_key = event_key
-                                        risk.open_stakes += stake
                                         task = asyncio.create_task(
                                             settle_and_record(
                                                 account_id_holder["id"], ctx,
@@ -1038,6 +1073,9 @@ async def run_symbol_loop(symbol: str, account_id_holder: dict, risk: RiskManage
                                             _background_tasks.discard
                                         )
                                 except Exception as trade_err:
+                                    if reserved:
+                                        risk.open_stakes = max(
+                                            0.0, risk.open_stakes - stake)
                                     print(f"[{symbol}] Trade error: {trade_err}")
                                     try:
                                         account_id_holder["id"] = (
@@ -1071,7 +1109,7 @@ async def main():
     account_id_holder = {"id": await get_demo_account_id()}
     risk = RiskManager()
 
-    print(f"Bot started (15m breakout mode). Running on: {', '.join(active)}")
+    print(f"Bot started (5m breakout mode, 1m trades). Running on: {', '.join(active)}")
     if DISABLED_SYMBOLS:
         print(f"Disabled symbols: {', '.join(DISABLED_SYMBOLS)}")
     print(f"Triggers: T1={TRIGGER1_ENABLED} T2={TRIGGER2_ENABLED} | "
@@ -1081,10 +1119,15 @@ async def main():
           f"Stake ladder (% of {BANKROLL}): {STAKE_LADDER_PCT}, start "
           f"{STAKE_START_PCT}%, per symbol | total at-risk limit "
           f"{MAX_TOTAL_RISK_PCT}%")
+    if risk.max_rung() < len(STAKE_LADDER_PCT) - 1:
+        print(f"Note: ladder is capped at {STAKE_LADDER_PCT[risk.max_rung()]}% "
+              f"(stake {stake_for_pct(STAKE_LADDER_PCT[risk.max_rung()]):.2f}) "
+              f"because higher rungs exceed the {risk.risk_limit():.2f} "
+              f"total at-risk limit.")
     if BREAKER_ENABLED:
         print(f"Circuit breaker: {MAX_CONSEC_LOSSES} losses in a row -> "
               f"{CONSEC_LOSS_PAUSE_HOURS}h pause | daily loss cap "
-              f"{MAX_DAILY_LOSS} -> pause until next day")
+              f"{MAX_DAILY_LOSS} -> {MAX_DAILY_LOSS_PAUSE_HOURS}h pause")
         print(f"Risk state: {risk.status_line()}")
     if REST_ENABLED:
         print(f"Rest period: day {REST_START_DAY} {REST_START_HOUR}:00 to "
