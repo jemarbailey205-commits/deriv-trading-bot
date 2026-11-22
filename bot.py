@@ -88,7 +88,7 @@ ATR_PERIOD    = 14
 
 # --- Momentum triggers ---
 TRIGGER1_ENABLED   = True    # both AO and AC cross zero close together
-TRIGGER2_ENABLED   = False    # one crosses zero + other shows a loose saucer
+TRIGGER2_ENABLED   = True     # one crosses zero + other shows a loose saucer
 CROSS_GAP          = 3       # max candles between the AO and AC crosses
 MOMENTUM_MAX_AGE   = 3       # latest cross must be at most this old
 SAUCER_BARS        = 2       # consecutive rising/falling bars after a reversal bar
@@ -99,6 +99,16 @@ STRUCTURE_LOOKBACK = 25      # candles to look back for swing high/low
 BREAKOUT_WINDOW    = 1       # breakout may be on the signal candle or up to this
                              # many candles before it (price must still be
                              # beyond the broken level on the signal candle)
+
+# --- Retest rejection (trade only after the broken level is retested and held) ---
+# After the breakout candle, the next REJECTION_CANDLES candles must each come
+# back to the broken level (within REJECTION_TOLERANCE_ATR x ATR of it) and
+# close back on the breakout side. The trade is placed at the close of the last
+# rejection candle. When on, the breakout must be exactly REJECTION_CANDLES
+# candles before the signal candle (BREAKOUT_WINDOW is then not used).
+REJECTION_ENABLED       = True
+REJECTION_CANDLES       = 2
+REJECTION_TOLERANCE_ATR = 0.25
 
 # --- Optional false-breakout filters (turn on one at a time and compare) ---
 BREAKOUT_BUFFER_ENABLED = False
@@ -383,19 +393,23 @@ def detect_momentum(df, ao, ac, direction: str, atr: float):
 
 # ====== STRUCTURE + FILTERS ======
 
-def broke_level(df: pd.DataFrame, direction: str, atr: float):
+def broke_level(df: pd.DataFrame, direction: str, atr: float,
+                only_offset=None):
     """
     Looks for a close beyond the swing high (up) or swing low (down) of the
     STRUCTURE_LOOKBACK candles before it, plus an optional ATR buffer. The
     breakout candle may be the signal candle (offset 0) or up to
     BREAKOUT_WINDOW candles earlier, but the signal candle's close must still
     be beyond the broken level (price hasn't fallen back inside).
+    If only_offset is given, only a breakout on that exact candle counts.
     Returns the offset of the breakout candle, or None.
     """
     buffer = BREAKOUT_BUFFER_ATR * atr if BREAKOUT_BUFFER_ENABLED else 0.0
     close_now = df["close"].iloc[-1]
 
-    for j in range(BREAKOUT_WINDOW + 1):
+    offsets = ([only_offset] if only_offset is not None
+               else range(BREAKOUT_WINDOW + 1))
+    for j in offsets:
         window = df.iloc[-(STRUCTURE_LOOKBACK + 1 + j):-(1 + j)]
         if len(window) < STRUCTURE_LOOKBACK:
             continue
@@ -423,6 +437,36 @@ def body_is_strong(df: pd.DataFrame, direction: str, offset: int = 0) -> bool:
     if (abs(c["close"] - c["open"]) / candle_range) < MIN_BODY_RATIO:
         return False
     return c["close"] > c["open"] if direction == "up" else c["close"] < c["open"]
+
+
+def level_rejected(df: pd.DataFrame, direction: str, atr: float, offset: int):
+    """
+    After a breakout `offset` candles ago, checks that each of the candles since
+    then rejected the broken level: it came back to the level (within the ATR
+    tolerance) but closed back on the breakout side. For a broken resistance
+    (up) that means low <= level + tol and close > level; for a broken support
+    (down), high >= level - tol and close < level.
+    Returns (ok, reason).
+    """
+    window = df.iloc[-(STRUCTURE_LOOKBACK + 1 + offset):-(1 + offset)]
+    tol = REJECTION_TOLERANCE_ATR * atr
+    level = window["high"].max() if direction == "up" else window["low"].min()
+
+    for k in range(REJECTION_CANDLES):
+        c = df.iloc[-1 - k]
+        if direction == "up":
+            touched = c["low"] <= level + tol
+            held = c["close"] > level
+        else:
+            touched = c["high"] >= level - tol
+            held = c["close"] < level
+        if not touched:
+            return False, (f"candle {k} ago never came back to the broken "
+                           f"level ({level:.4f})")
+        if not held:
+            return False, (f"candle {k} ago closed back through the broken "
+                           f"level ({level:.4f})")
+    return True, ""
 
 
 # ====== CHOPPY-MARKET FILTER ======
@@ -487,11 +531,22 @@ def check_signal(df: pd.DataFrame):
         trigger, cross_epoch = momentum
         level = "resistance" if direction == "up" else "support"
 
-        offset = broke_level(df, direction, atr)
+        offset = broke_level(
+            df, direction, atr,
+            only_offset=REJECTION_CANDLES if REJECTION_ENABLED else None)
         if offset is None:
+            extra = (f" {REJECTION_CANDLES} candles ago"
+                     if REJECTION_ENABLED else "")
             print(f"  {trigger} {direction} momentum seen but price "
-                  f"({close_price:.4f}) hasn't broken {level}, skipping.")
+                  f"({close_price:.4f}) hasn't broken {level}{extra}, skipping.")
             continue
+        if REJECTION_ENABLED:
+            rejected, why = level_rejected(df, direction, atr, offset)
+            if not rejected:
+                print(f"  {trigger} {direction} breakout rejected: {why}.")
+                continue
+            print(f"  {trigger} {direction}: {REJECTION_CANDLES} candles "
+                  f"rejected the broken {level}.")
         if offset > 0:
             print(f"  {trigger} {direction}: breakout was {offset} candle(s) "
                   f"ago and price is still beyond {level}.")
@@ -1114,6 +1169,9 @@ async def main():
         print(f"Disabled symbols: {', '.join(DISABLED_SYMBOLS)}")
     print(f"Triggers: T1={TRIGGER1_ENABLED} T2={TRIGGER2_ENABLED} | "
           f"Buffer={BREAKOUT_BUFFER_ENABLED} Body={BODY_FILTER_ENABLED}")
+    print(f"Retest rejection: {REJECTION_ENABLED} "
+          f"({REJECTION_CANDLES} candles, tolerance "
+          f"{REJECTION_TOLERANCE_ATR} x ATR)")
     print(f"Choppy filter: ADX>={ADX_MIN} ({ADX_FILTER_ENABLED}), "
           f"ATR ratio>={ATR_RATIO_MIN} ({ATR_RATIO_ENABLED}) | "
           f"Stake ladder (% of {BANKROLL}): {STAKE_LADDER_PCT}, start "
