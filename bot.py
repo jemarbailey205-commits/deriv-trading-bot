@@ -100,15 +100,14 @@ BREAKOUT_WINDOW    = 1       # breakout may be on the signal candle or up to thi
                              # many candles before it (price must still be
                              # beyond the broken level on the signal candle)
 
-# --- Retest rejection (trade only after the broken level is retested and held) ---
-# After the breakout candle, the next REJECTION_CANDLES candles must each come
-# back to the broken level (within REJECTION_TOLERANCE_ATR x ATR of it) and
-# close back on the breakout side. The trade is placed at the close of the last
-# rejection candle. When on, the breakout must be exactly REJECTION_CANDLES
-# candles before the signal candle (BREAKOUT_WINDOW is then not used).
-REJECTION_ENABLED       = True
-REJECTION_CANDLES       = 2
-REJECTION_TOLERANCE_ATR = 0.25
+# --- Continuation after the breakout (trade only once the move keeps going) ---
+# After the breakout candle, each of the next CONTINUATION_CANDLES candles must
+# make a higher high than the candle before it (breaking resistance) or a lower
+# low (breaking support). The trade is placed at the close of the last of them.
+# When on, the breakout must be exactly CONTINUATION_CANDLES candles before the
+# signal candle (BREAKOUT_WINDOW is then not used).
+CONTINUATION_ENABLED = True
+CONTINUATION_CANDLES = 2
 
 # --- Optional false-breakout filters (turn on one at a time and compare) ---
 BREAKOUT_BUFFER_ENABLED = False
@@ -439,33 +438,22 @@ def body_is_strong(df: pd.DataFrame, direction: str, offset: int = 0) -> bool:
     return c["close"] > c["open"] if direction == "up" else c["close"] < c["open"]
 
 
-def level_rejected(df: pd.DataFrame, direction: str, atr: float, offset: int):
+def keeps_extending(df: pd.DataFrame, direction: str, offset: int):
     """
-    After a breakout `offset` candles ago, checks that each of the candles since
-    then rejected the broken level: it came back to the level (within the ATR
-    tolerance) but closed back on the breakout side. For a broken resistance
-    (up) that means low <= level + tol and close > level; for a broken support
-    (down), high >= level - tol and close < level.
+    After a breakout `offset` candles ago, checks that every candle since then
+    kept going: each one makes a higher high than the candle before it (up) or
+    a lower low (down), starting from the breakout candle itself.
     Returns (ok, reason).
     """
-    window = df.iloc[-(STRUCTURE_LOOKBACK + 1 + offset):-(1 + offset)]
-    tol = REJECTION_TOLERANCE_ATR * atr
-    level = window["high"].max() if direction == "up" else window["low"].min()
-
-    for k in range(REJECTION_CANDLES):
+    for k in range(offset - 1, -1, -1):          # oldest to newest
+        prev = df.iloc[-2 - k]
         c = df.iloc[-1 - k]
-        if direction == "up":
-            touched = c["low"] <= level + tol
-            held = c["close"] > level
-        else:
-            touched = c["high"] >= level - tol
-            held = c["close"] < level
-        if not touched:
-            return False, (f"candle {k} ago never came back to the broken "
-                           f"level ({level:.4f})")
-        if not held:
-            return False, (f"candle {k} ago closed back through the broken "
-                           f"level ({level:.4f})")
+        if direction == "up" and not c["high"] > prev["high"]:
+            return False, (f"candle {k} ago didn't make a higher high "
+                           f"({c['high']:.4f} vs {prev['high']:.4f})")
+        if direction == "down" and not c["low"] < prev["low"]:
+            return False, (f"candle {k} ago didn't make a lower low "
+                           f"({c['low']:.4f} vs {prev['low']:.4f})")
     return True, ""
 
 
@@ -533,20 +521,21 @@ def check_signal(df: pd.DataFrame):
 
         offset = broke_level(
             df, direction, atr,
-            only_offset=REJECTION_CANDLES if REJECTION_ENABLED else None)
+            only_offset=CONTINUATION_CANDLES if CONTINUATION_ENABLED else None)
         if offset is None:
-            extra = (f" {REJECTION_CANDLES} candles ago"
-                     if REJECTION_ENABLED else "")
+            extra = (f" {CONTINUATION_CANDLES} candles ago"
+                     if CONTINUATION_ENABLED else "")
             print(f"  {trigger} {direction} momentum seen but price "
                   f"({close_price:.4f}) hasn't broken {level}{extra}, skipping.")
             continue
-        if REJECTION_ENABLED:
-            rejected, why = level_rejected(df, direction, atr, offset)
-            if not rejected:
+        if CONTINUATION_ENABLED:
+            extending, why = keeps_extending(df, direction, offset)
+            if not extending:
                 print(f"  {trigger} {direction} breakout rejected: {why}.")
                 continue
-            print(f"  {trigger} {direction}: {REJECTION_CANDLES} candles "
-                  f"rejected the broken {level}.")
+            what = "higher highs" if direction == "up" else "lower lows"
+            print(f"  {trigger} {direction}: {CONTINUATION_CANDLES} candles "
+                  f"kept making {what} after breaking {level}.")
         if offset > 0:
             print(f"  {trigger} {direction}: breakout was {offset} candle(s) "
                   f"ago and price is still beyond {level}.")
@@ -1169,9 +1158,8 @@ async def main():
         print(f"Disabled symbols: {', '.join(DISABLED_SYMBOLS)}")
     print(f"Triggers: T1={TRIGGER1_ENABLED} T2={TRIGGER2_ENABLED} | "
           f"Buffer={BREAKOUT_BUFFER_ENABLED} Body={BODY_FILTER_ENABLED}")
-    print(f"Retest rejection: {REJECTION_ENABLED} "
-          f"({REJECTION_CANDLES} candles, tolerance "
-          f"{REJECTION_TOLERANCE_ATR} x ATR)")
+    print(f"Continuation after breakout: {CONTINUATION_ENABLED} "
+          f"({CONTINUATION_CANDLES} candles of higher highs / lower lows)")
     print(f"Choppy filter: ADX>={ADX_MIN} ({ADX_FILTER_ENABLED}), "
           f"ATR ratio>={ATR_RATIO_MIN} ({ATR_RATIO_ENABLED}) | "
           f"Stake ladder (% of {BANKROLL}): {STAKE_LADDER_PCT}, start "
