@@ -107,7 +107,7 @@ BREAKOUT_WINDOW    = 1       # breakout may be on the signal candle or up to thi
 # When on, the breakout must be exactly CONTINUATION_CANDLES candles before the
 # signal candle (BREAKOUT_WINDOW is then not used).
 CONTINUATION_ENABLED = True
-CONTINUATION_CANDLES = 2
+CONTINUATION_CANDLES = 1
 
 # --- Optional false-breakout filters (turn on one at a time and compare) ---
 BREAKOUT_BUFFER_ENABLED = False
@@ -126,19 +126,22 @@ ATR_RATIO_ENABLED  = True
 ATR_AVG_PERIOD     = 30      # compare ATR to its own average over this many candles
 ATR_RATIO_MIN      = 0.9     # skip if ATR is below this x its recent average
 
-# --- Stake ladder (each symbol has its own position on the ladder) ---
-# Percent of BANKROLL. A win moves one step right, a loss one step left.
-# First rung 20% and last rung 80% are the floor and the hard cap.
-STAKE_LADDER_PCT   = [20, 30, 40, 60, 80]
-STAKE_START_PCT    = 40          # every symbol starts here, and resets here
-RESET_LADDER_AFTER_PAUSE = True  # back to the start rung after a breaker pause
+# --- Stake ladder (ONE ladder shared by all symbols and all signals) ---
+# Percent of BANKROLL: 20% = $2, 40% = $4, 60% = $6 on a $10 bankroll.
+# A win moves one step up. ANY loss drops the stake straight to the first rung
+# ($2). A loss while already at that $2 stake triggers the pause below.
+STAKE_LADDER_PCT   = [20, 40, 60]
+STAKE_START_PCT    = 40          # the very first trade uses this rung
+RESET_LADDER_AFTER_PAUSE = False # after a pause, keep the current ($2) stake
 MAX_TOTAL_RISK_PCT = 60          # combined stake of all open trades, % of BANKROLL
 MIN_STAKE          = 1.0         # Deriv's minimum stake - never go below this
 
 # --- Loss circuit breaker ---
 BREAKER_ENABLED         = True
-MAX_CONSEC_LOSSES       = 3      # pause after this many losses in a row (0 = off)
-CONSEC_LOSS_PAUSE_HOURS = 3      # length of that pause
+MAX_CONSEC_LOSSES       = 0      # old "N losses in a row" rule (0 = off); the
+                                 # loss-at-the-$2-stake rule below replaces it
+CONSEC_LOSS_PAUSE_HOURS = 6      # pause length when a trade loses at the $2 stake
+                                 # (the first rung of the ladder)
 MAX_DAILY_LOSS          = 8      # pause when the day's net loss reaches this amount
                                  # (0 = off). Open trades count as possible losses,
                                  # so the cap holds.
@@ -670,6 +673,9 @@ def stake_for_pct(pct: float) -> float:
     return round(max(MIN_STAKE, BANKROLL * pct / 100.0), 2)
 
 
+SHARED_KEY = "*"                 # one ladder for every symbol
+
+
 def start_rung() -> int:
     if STAKE_START_PCT in STAKE_LADDER_PCT:
         return STAKE_LADDER_PCT.index(STAKE_START_PCT)
@@ -701,7 +707,7 @@ class RiskManager:
         self.pause_reason = ""
         self.pause_clears_daily = False  # daily-cap pause: reset day P&L on resume
         self.open_stakes = 0.0          # stake currently riding on unsettled trades
-        self.rungs = {}                 # {symbol: position on the stake ladder}
+        self.rungs = {}                 # {"*": position on the shared stake ladder}
         self.symbol_stats = {}          # since this start: {symbol: {w, l, pnl}}
         self._load()
         self._roll_day()
@@ -754,7 +760,7 @@ class RiskManager:
         self.pause_clears_daily = clear_daily
         if RESET_LADDER_AFTER_PAUSE:
             self.rungs = {}
-            print("Stake ladder reset to the starting rung for every symbol.")
+            print("Stake ladder reset to the starting rung.")
         resume = _local_now() + timedelta(seconds=until_ts - time.time())
         print(f"*** CIRCUIT BREAKER: {reason}. Trading paused until "
               f"{resume.strftime('%a %H:%M')} ({REST_TIMEZONE}). ***")
@@ -770,7 +776,7 @@ class RiskManager:
         return max(ok) if ok else 0
 
     def current_stake(self, symbol: str) -> float:
-        rung = min(self.rungs.get(symbol, start_rung()), self.max_rung())
+        rung = min(self.rungs.get(SHARED_KEY, start_rung()), self.max_rung())
         return stake_for_pct(STAKE_LADDER_PCT[rung])
 
     def risk_limit(self) -> float:
@@ -816,12 +822,13 @@ class RiskManager:
             self.streak = 0
 
         top = self.max_rung()
-        rung = min(self.rungs.get(symbol, start_rung()), top)
+        rung = min(self.rungs.get(SHARED_KEY, start_rung()), top)
+        lost_at_floor = profit < 0 and rung == 0
         if profit > 0:
             rung = min(top, rung + 1)
         elif profit < 0:
-            rung = max(0, rung - 1)
-        self.rungs[symbol] = rung
+            rung = 0                      # any loss: straight back to $2
+        self.rungs[SHARED_KEY] = rung
 
         st = self.symbol_stats.setdefault(symbol, {"w": 0, "l": 0, "pnl": 0.0})
         st["pnl"] += profit
@@ -836,6 +843,10 @@ class RiskManager:
                 self._pause(time.time() + MAX_DAILY_LOSS_PAUSE_HOURS * 3600,
                             f"daily loss cap reached ({self.daily_pnl:+.2f})",
                             clear_daily=True)
+            elif lost_at_floor and time.time() >= self.pause_until:
+                floor = stake_for_pct(STAKE_LADDER_PCT[0])
+                self._pause(time.time() + CONSEC_LOSS_PAUSE_HOURS * 3600,
+                            f"loss at the {floor:.2f} stake")
             elif MAX_CONSEC_LOSSES > 0 and self.streak >= MAX_CONSEC_LOSSES:
                 self._pause(time.time() + CONSEC_LOSS_PAUSE_HOURS * 3600,
                             f"{self.streak} losses in a row")
@@ -1163,7 +1174,7 @@ async def main():
     print(f"Choppy filter: ADX>={ADX_MIN} ({ADX_FILTER_ENABLED}), "
           f"ATR ratio>={ATR_RATIO_MIN} ({ATR_RATIO_ENABLED}) | "
           f"Stake ladder (% of {BANKROLL}): {STAKE_LADDER_PCT}, start "
-          f"{STAKE_START_PCT}%, per symbol | total at-risk limit "
+          f"{STAKE_START_PCT}%, shared by all symbols | total at-risk limit "
           f"{MAX_TOTAL_RISK_PCT}%")
     if risk.max_rung() < len(STAKE_LADDER_PCT) - 1:
         print(f"Note: ladder is capped at {STAKE_LADDER_PCT[risk.max_rung()]}% "
@@ -1171,7 +1182,8 @@ async def main():
               f"because higher rungs exceed the {risk.risk_limit():.2f} "
               f"total at-risk limit.")
     if BREAKER_ENABLED:
-        print(f"Circuit breaker: {MAX_CONSEC_LOSSES} losses in a row -> "
+        print(f"Circuit breaker: a loss at the "
+              f"{stake_for_pct(STAKE_LADDER_PCT[0]):.2f} stake -> "
               f"{CONSEC_LOSS_PAUSE_HOURS}h pause | daily loss cap "
               f"{MAX_DAILY_LOSS} -> {MAX_DAILY_LOSS_PAUSE_HOURS}h pause")
         print(f"Risk state: {risk.status_line()}")
