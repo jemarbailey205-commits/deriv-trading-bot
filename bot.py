@@ -87,12 +87,17 @@ MIN_CANDLES   = 50           # AO needs 34, AC needs ~38; extra buffer
 ATR_PERIOD    = 14
 
 # --- Momentum triggers ---
-TRIGGER1_ENABLED   = True    # both AO and AC cross zero close together
+TRIGGER1_ENABLED   = False   # both AO and AC cross zero close together
 TRIGGER2_ENABLED   = True     # one crosses zero + other shows a loose saucer
 CROSS_GAP          = 3       # max candles between the AO and AC crosses
 MOMENTUM_MAX_AGE   = 3       # latest cross must be at most this old
 SAUCER_BARS        = 2       # consecutive rising/falling bars after a reversal bar
 SAUCER_MIN_ATR     = 0.05    # min total move of the saucer, as a fraction of ATR
+
+# --- Breakout requirement (master switch) ---
+# False = no breakout or continuation check at all: the saucer signal (plus the
+# choppy-market filter) is enough. True = also require the breakout rules below.
+BREAKOUT_ENABLED   = False
 
 # --- Structure filter ---
 STRUCTURE_LOOKBACK = 25      # candles to look back for swing high/low
@@ -522,33 +527,38 @@ def check_signal(df: pd.DataFrame):
         trigger, cross_epoch = momentum
         level = "resistance" if direction == "up" else "support"
 
-        offset = broke_level(
-            df, direction, atr,
-            only_offset=CONTINUATION_CANDLES if CONTINUATION_ENABLED else None)
-        if offset is None:
-            extra = (f" {CONTINUATION_CANDLES} candles ago"
-                     if CONTINUATION_ENABLED else "")
-            print(f"  {trigger} {direction} momentum seen but price "
-                  f"({close_price:.4f}) hasn't broken {level}{extra}, skipping.")
-            continue
-        if CONTINUATION_ENABLED:
-            extending, why = keeps_extending(df, direction, offset)
-            if not extending:
-                print(f"  {trigger} {direction} breakout rejected: {why}.")
+        offset = 0
+        if BREAKOUT_ENABLED:
+            offset = broke_level(
+                df, direction, atr,
+                only_offset=CONTINUATION_CANDLES if CONTINUATION_ENABLED else None)
+            if offset is None:
+                extra = (f" {CONTINUATION_CANDLES} candles ago"
+                         if CONTINUATION_ENABLED else "")
+                print(f"  {trigger} {direction} momentum seen but price "
+                      f"({close_price:.4f}) hasn't broken {level}{extra}, "
+                      f"skipping.")
                 continue
-            what = "higher highs" if direction == "up" else "lower lows"
-            print(f"  {trigger} {direction}: {CONTINUATION_CANDLES} candles "
-                  f"kept making {what} after breaking {level}.")
-        if offset > 0:
-            print(f"  {trigger} {direction}: breakout was {offset} candle(s) "
-                  f"ago and price is still beyond {level}.")
+            if CONTINUATION_ENABLED:
+                extending, why = keeps_extending(df, direction, offset)
+                if not extending:
+                    print(f"  {trigger} {direction} rejected: {why}.")
+                    continue
+                what = "higher highs" if direction == "up" else "lower lows"
+                print(f"  {trigger} {direction}: {CONTINUATION_CANDLES} candles "
+                      f"kept making {what} after breaking {level}.")
+            if offset > 0:
+                print(f"  {trigger} {direction}: breakout was {offset} "
+                      f"candle(s) ago and price is still beyond {level}.")
         trending, why = market_is_trending(info)
         if not trending:
-            print(f"  {trigger} {direction} breakout rejected: {why}.")
+            print(f"  {trigger} {direction} rejected: {why}.")
             continue
         if not body_is_strong(df, direction, offset):
-            print(f"  {trigger} {direction} breakout rejected: weak candle body.")
+            print(f"  {trigger} {direction} rejected: weak candle body.")
             continue
+        print(f"  {trigger} {direction}: saucer signal confirmed"
+              f"{'' if BREAKOUT_ENABLED else ' (no breakout required)'}.")
 
         return signal, signal_epoch, trigger, (direction, cross_epoch), info
 
@@ -1169,8 +1179,10 @@ async def main():
         print(f"Disabled symbols: {', '.join(DISABLED_SYMBOLS)}")
     print(f"Triggers: T1={TRIGGER1_ENABLED} T2={TRIGGER2_ENABLED} | "
           f"Buffer={BREAKOUT_BUFFER_ENABLED} Body={BODY_FILTER_ENABLED}")
-    print(f"Continuation after breakout: {CONTINUATION_ENABLED} "
-          f"({CONTINUATION_CANDLES} candles of higher highs / lower lows)")
+    print(f"Breakout required: {BREAKOUT_ENABLED}"
+          + (f" | continuation {CONTINUATION_ENABLED} "
+             f"({CONTINUATION_CANDLES} candles of higher highs / lower lows)"
+             if BREAKOUT_ENABLED else ""))
     print(f"Choppy filter: ADX>={ADX_MIN} ({ADX_FILTER_ENABLED}), "
           f"ATR ratio>={ATR_RATIO_MIN} ({ATR_RATIO_ENABLED}) | "
           f"Stake ladder (% of {BANKROLL}): {STAKE_LADDER_PCT}, start "
